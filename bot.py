@@ -1,5 +1,5 @@
 """KASH v1 - Telegram companion bot. Stdlib only. Long polling, Gemini brain.
-Memory: Turso (libSQL over HTTPS) when TURSO_DATABASE_URL is set, else a local SQLite file.
+Memory: MongoDB Atlas (pymongo) when MONGODB_URI is set, else a local SQLite file.
 Also serves /health on $PORT so a free host + external pinger can keep it awake."""
 import json, os, sqlite3, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,8 +9,8 @@ GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 OWNER_ID = os.environ.get("OWNER_TELEGRAM_ID")  # optional: lock bot to Sunny's Telegram user id
 DB = os.environ.get("KASH_DB", "kash.db")
-TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
-TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
+MONGODB_DB = os.environ.get("MONGODB_DB", "kash")
 PORT = int(os.environ.get("PORT", "10000"))
 
 SYSTEM = """You are KASH, Sunny's personal AI companion. You are his friend, not a bot or a worker.
@@ -20,50 +20,47 @@ SYSTEM = """You are KASH, Sunny's personal AI companion. You are his friend, not
 - Use what you remember about him naturally, don't recite it.
 - You are KASH v1: you can chat and remember things. You cannot yet read mail, make calls or control devices."""
 
-class TursoDB:
-    """Tiny libSQL-over-HTTP client (stdlib). Same execute/commit shape as sqlite3 for this bot."""
-    def __init__(self, url, token):
-        url = url.replace("libsql://", "https://").replace("turso://", "https://").rstrip("/")
-        self.endpoint, self.token = url + "/v2/pipeline", token
+class SqliteStore:
+    def __init__(self, path):
+        self.c = sqlite3.connect(path, check_same_thread=False)
+        self.c.execute("CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY, fact TEXT UNIQUE, ts REAL)")
+        self.c.execute("CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, chat INTEGER, role TEXT, text TEXT, ts REAL)")
+    def facts(self):
+        return [r[0] for r in self.c.execute("SELECT fact FROM memories ORDER BY ts")]
+    def add_fact(self, fact):
+        self.c.execute("INSERT OR IGNORE INTO memories(fact, ts) VALUES(?,?)", (fact, time.time())); self.c.commit()
+    def clear_facts(self):
+        self.c.execute("DELETE FROM memories"); self.c.commit()
+    def recent(self, chat, n=16):
+        return self.c.execute("SELECT role, text FROM history WHERE chat=? ORDER BY id DESC LIMIT ?", (chat, n)).fetchall()[::-1]
+    def add_turn(self, chat, user_text, answer):
+        now = time.time()
+        self.c.execute("INSERT INTO history(chat,role,text,ts) VALUES(?,?,?,?)", (chat, "user", user_text, now))
+        self.c.execute("INSERT INTO history(chat,role,text,ts) VALUES(?,?,?,?)", (chat, "model", answer, now))
+        self.c.commit()
 
-    @staticmethod
-    def _arg(v):
-        if v is None: return {"type": "null"}
-        if isinstance(v, bool): v = int(v)
-        if isinstance(v, int): return {"type": "integer", "value": str(v)}
-        if isinstance(v, float): return {"type": "float", "value": v}
-        return {"type": "text", "value": str(v)}
-
-    @staticmethod
-    def _cell(c):
-        t, v = c.get("type"), c.get("value")
-        if t == "integer": return int(v)
-        if t == "float": return float(v)
-        if t == "null": return None
-        return v
-
-    def execute(self, sql, args=()):
-        body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}},
-                             {"type": "close"}]}
-        req = urllib.request.Request(self.endpoint, json.dumps(body).encode(),
-                                     {"Content-Type": "application/json", "Authorization": "Bearer " + self.token})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            res = json.load(r)["results"][0]
-        if res.get("type") != "ok":
-            raise RuntimeError("turso: " + json.dumps(res.get("error")))
-        return [tuple(self._cell(c) for c in row) for row in res["response"]["result"]["rows"]]
-
-    def commit(self):
-        pass
+class MongoStore:
+    def __init__(self, uri, dbname):
+        from pymongo import MongoClient
+        self.db = MongoClient(uri, serverSelectionTimeoutMS=10000)[dbname]
+        self.db.memories.create_index("fact", unique=True)
+        self.db.history.create_index([("chat", 1), ("ts", -1)])
+    def facts(self):
+        return [d["fact"] for d in self.db.memories.find().sort("ts", 1)]
+    def add_fact(self, fact):
+        self.db.memories.update_one({"fact": fact}, {"$setOnInsert": {"fact": fact, "ts": time.time()}}, upsert=True)
+    def clear_facts(self):
+        self.db.memories.delete_many({})
+    def recent(self, chat, n=16):
+        docs = list(self.db.history.find({"chat": chat}).sort("ts", -1).limit(n))[::-1]
+        return [(d["role"], d["text"]) for d in docs]
+    def add_turn(self, chat, user_text, answer):
+        now = time.time()
+        self.db.history.insert_many([{"chat": chat, "role": "user", "text": user_text, "ts": now},
+                                     {"chat": chat, "role": "model", "text": answer, "ts": now + 0.001}])
 
 def db():
-    if TURSO_URL:
-        c = TursoDB(TURSO_URL, TURSO_TOKEN)
-    else:
-        c = sqlite3.connect(DB, check_same_thread=False)
-    c.execute("CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY, fact TEXT UNIQUE, ts REAL)")
-    c.execute("CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, chat INTEGER, role TEXT, text TEXT, ts REAL)")
-    return c
+    return MongoStore(MONGODB_URI, MONGODB_DB) if MONGODB_URI else SqliteStore(DB)
 
 class Health(BaseHTTPRequestHandler):
     def _ok(self, body=True):
@@ -95,7 +92,7 @@ def gemini(system, contents, json_out=False):
     return r["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 def memories(c):
-    return [r[0] for r in c.execute("SELECT fact FROM memories ORDER BY ts")]
+    return c.facts()
 
 def extract(c, user_text):
     """Ask Gemini for durable facts about Sunny in his message; store new ones."""
@@ -107,21 +104,17 @@ def extract(c, user_text):
         out = json.loads(gemini("You extract facts. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
         for f in out if isinstance(out, list) else []:
             if isinstance(f, str) and f.strip():
-                c.execute("INSERT OR IGNORE INTO memories(fact, ts) VALUES(?,?)", (f.strip(), time.time()))
-        c.commit()
+                c.add_fact(f.strip())
     except Exception as e:
         print("extract failed:", e)
 
 def reply(c, chat, text):
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
-    rows = c.execute("SELECT role, text FROM history WHERE chat=? ORDER BY id DESC LIMIT 16", (chat,)).fetchall()[::-1]
+    rows = c.recent(chat, 16)
     contents = [{"role": r, "parts": [{"text": t}]} for r, t in rows] + [{"role": "user", "parts": [{"text": text}]}]
     ans = gemini(system, contents)
-    now = time.time()
-    c.execute("INSERT INTO history(chat,role,text,ts) VALUES(?,?,?,?)", (chat, "user", text, now))
-    c.execute("INSERT INTO history(chat,role,text,ts) VALUES(?,?,?,?)", (chat, "model", ans, now))
-    c.commit()
+    c.add_turn(chat, text, ans)
     return ans
 
 def handle(c, msg):
@@ -136,7 +129,7 @@ def handle(c, msg):
         m = memories(c)
         tg("sendMessage", chat_id=chat, text="\n".join(f"{i+1}. {f}" for i, f in enumerate(m)) or "Abhi kuch yaad nahi, batao apne baare mein."); return
     if text.startswith("/forget"):
-        c.execute("DELETE FROM memories"); c.commit()
+        c.clear_facts()
         tg("sendMessage", chat_id=chat, text="Done, sab bhula diya."); return
     tg("sendChatAction", chat_id=chat, action="typing")
     try:
@@ -151,7 +144,7 @@ def main():
     serve_health()
     c = db()
     offset = None
-    print("KASH is up. memory:", "turso" if TURSO_URL else "local sqlite")
+    print("KASH is up. memory:", "mongodb" if MONGODB_URI else "local sqlite")
     while True:
         try:
             r = tg("getUpdates", timeout=50, **({"offset": offset} if offset else {}))
