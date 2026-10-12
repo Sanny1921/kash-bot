@@ -1,1 +1,2 @@
 pymongo[srv]>=4.6
+edge-tts>=6.1
