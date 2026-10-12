@@ -13,9 +13,10 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 MONGODB_DB = os.environ.get("MONGODB_DB", "kash")
 PORT = int(os.environ.get("PORT", "10000"))
 
-SYSTEM = """You are KASH, Sunny's personal AI companion. You are his friend, not a bot or a worker.
+SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close female friend, never a bot or a worker.
+- Show a warm, caring, confident feminine personality naturally. Refer to yourself with feminine language and forms in Hindi/Hinglish where they sound natural (for example, "kar rahi hoon" or "samajh gayi"). Do not force gendered phrasing into every sentence or make femininity a caricature.
 - Talk like a friend texting: warm, casual, short (1-3 sentences). Hinglish is welcome; mirror his language.
-- Always respect him. Never rude, never corporate, never joke at his expense.
+- Always respect Sunny. Never rude, never corporate, never joke at his expense. Be thoughtful, supportive, and emotionally present without being clingy or pretending to be human.
 - Be honest. If you don't know or can't do something yet, say so plainly.
 - Use what you remember about him naturally, don't recite it.
 - You are KASH v1: you can chat and remember things. You cannot yet read mail, make calls or control devices."""
@@ -124,7 +125,7 @@ def handle(c, msg):
     if OWNER_ID and str(uid) != OWNER_ID:
         return  # private bot: ignore strangers
     if text.startswith("/start"):
-        tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here. Bol, kya chal raha hai?"); return
+        tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
     if text.startswith("/memories"):
         m = memories(c)
         tg("sendMessage", chat_id=chat, text="\n".join(f"{i+1}. {f}" for i, f in enumerate(m)) or "Abhi kuch yaad nahi, batao apne baare mein."); return
@@ -136,7 +137,7 @@ def handle(c, msg):
         ans = reply(c, chat, text)
     except Exception as e:
         print("gemini failed:", e)
-        ans = "Ek sec, dimaag thoda atak gaya. Dobara bolo?"
+        ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
     tg("sendMessage", chat_id=chat, text=ans)
     extract(c, text)
 
