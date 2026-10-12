@@ -3,7 +3,7 @@ import json, os, sqlite3, time, urllib.request, urllib.error
 
 TG = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 OWNER_ID = os.environ.get("OWNER_TELEGRAM_ID")  # optional: lock bot to Sunny's Telegram user id
 DB = os.environ.get("KASH_DB", "kash.db")
 
