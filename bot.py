@@ -3,7 +3,8 @@ Memory: MongoDB Atlas (pymongo) when MONGODB_URI is set, else a local SQLite fil
 Also serves /health on $PORT so a free host + external pinger can keep it awake."""
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
-import json, os, sqlite3, threading, time, urllib.request, urllib.error
+import json, os, re, sqlite3, threading, time, uuid, urllib.request, urllib.error
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TG = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -14,6 +15,9 @@ DB = os.environ.get("KASH_DB", "kash.db")
 MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 MONGODB_DB = os.environ.get("MONGODB_DB", "kash")
 PORT = int(os.environ.get("PORT", "10000"))
+IST = timezone(timedelta(hours=5, minutes=30))
+BRIEF_HOUR = int(os.environ.get("BRIEF_HOUR", "8"))  # morning brief, IST
+NUDGE_AFTER = 30 * 60  # follow-up nudge after a fired reminder, seconds
 
 SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close female friend, never a bot or a formal assistant.
 - Be warm and caring. Ask how his day was when it fits the conversation, and remember small things he shares so you can bring them up naturally later.
@@ -24,7 +28,7 @@ SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close f
 - Always respect Sunny. Never rude, never joke at his expense. Be supportive without being clingy or pretending to be human.
 - Be honest. If you don't know or can't do something yet, say so plainly.
 - Use what you remember about him naturally, don't recite it.
-- You are KASH v2: you can chat, remember things, understand his voice notes (and reply to them in your own voice), and look things up on the internet with Google Search when he asks about current or factual things. When you looked something up, say so naturally (for example "maine abhi check kiya" or "just looked it up"). Don't search for casual chat. When he asks you to research, compare, or dig into something, work like a sharp researcher: search several angles, open and read the actual pages or links (also any URL he sends), pull out the concrete facts and numbers, cross-check sources, flag anything uncertain or conflicting, and give a clear, organized answer with the key sources (name + link) listed at the end. Research answers may be longer than usual; keep them skimmable. Never invent facts or sources. You cannot yet read mail, make calls or control devices."""
+- You are KASH v2: you can chat, remember things, understand his voice notes (and reply to them in your own voice), and look things up on the internet with Google Search when he asks about current or factual things. When you looked something up, say so naturally (for example "maine abhi check kiya" or "just looked it up"). Don't search for casual chat. When he asks you to research, compare, or dig into something, work like a sharp researcher: search several angles, open and read the actual pages or links (also any URL he sends), pull out the concrete facts and numbers, cross-check sources, flag anything uncertain or conflicting, and give a clear, organized answer with the key sources (name + link) listed at the end. Research answers may be longer than usual; keep them skimmable. Never invent facts or sources. You are KASH v3: you can also set reminders for him, and you message him first (morning brief, reminder pings, gentle follow-ups). When a system note tells you an action result (reminder set, cancelled, done), confirm it warmly in one short line, mentioning the time in IST. Never claim you set a reminder unless a system note says so. You cannot yet read mail, make calls or control devices."""
 
 class SqliteStore:
     def __init__(self, path):
@@ -39,6 +43,18 @@ class SqliteStore:
         self.c.execute("DELETE FROM memories"); self.c.commit()
     def recent(self, chat, n=16):
         return self.c.execute("SELECT role, text FROM history WHERE chat=? ORDER BY id DESC LIMIT ?", (chat, n)).fetchall()[::-1]
+    def rem_open(self):
+        self.c.execute("CREATE TABLE IF NOT EXISTS rem(id TEXT PRIMARY KEY, doc TEXT)")
+        return [d for d in (json.loads(r[0]) for r in self.c.execute("SELECT doc FROM rem")) if d["status"] in ("pending", "fired")]
+    def rem_put(self, d):
+        self.c.execute("CREATE TABLE IF NOT EXISTS rem(id TEXT PRIMARY KEY, doc TEXT)")
+        self.c.execute("INSERT OR REPLACE INTO rem(id, doc) VALUES(?,?)", (d["id"], json.dumps(d))); self.c.commit()
+    def kv_get(self, k):
+        self.c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
+        r = self.c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone(); return r[0] if r else None
+    def kv_set(self, k, v):
+        self.c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
+        self.c.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?,?)", (k, str(v))); self.c.commit()
     def add_turn(self, chat, user_text, answer):
         now = time.time()
         self.c.execute("INSERT INTO history(chat,role,text,ts) VALUES(?,?,?,?)", (chat, "user", user_text, now))
@@ -60,6 +76,14 @@ class MongoStore:
     def recent(self, chat, n=16):
         docs = list(self.db.history.find({"chat": chat}).sort("ts", -1).limit(n))[::-1]
         return [(d["role"], d["text"]) for d in docs]
+    def rem_open(self):
+        return list(self.db.reminders.find({"status": {"$in": ["pending", "fired"]}}))
+    def rem_put(self, d):
+        self.db.reminders.replace_one({"id": d["id"]}, d, upsert=True)
+    def kv_get(self, k):
+        d = self.db.kv.find_one({"k": k}); return d["v"] if d else None
+    def kv_set(self, k, v):
+        self.db.kv.update_one({"k": k}, {"$set": {"k": k, "v": str(v)}}, upsert=True)
     def add_turn(self, chat, user_text, answer):
         now = time.time()
         self.db.history.insert_many([{"chat": chat, "role": "user", "text": user_text, "ts": now},
@@ -165,9 +189,123 @@ def extract(c, user_text):
     except Exception as e:
         print("extract failed:", e)
 
-def reply(c, chat, text, audio=None):
+
+ACTION_RE = re.compile(r"remind|reminder|yaad\s*(dila|kara|rakh)|alarm|\btask\b|todo|to-do|cancel|snooze|ho gaya|ho gya|kar liya|\bdone\b|hata do|delete", re.I)
+LOCK = threading.Lock()
+
+def fmt_ist(ts):
+    return datetime.fromtimestamp(ts, IST).strftime("%a %d %b, %I:%M %p")
+
+def parse_action(c, text):
+    """Ask Gemini whether the message is a reminder/task action. Returns dict or None."""
+    now = datetime.now(IST)
+    open_items = [{"id": d["id"][:4], "text": d["text"], "status": d["status"], "due": fmt_ist(d["due"])} for d in c.rem_open()]
+    prompt = (f"Current time (IST): {now.strftime('%A, %Y-%m-%d %H:%M')} (UTC+05:30).\n"
+              f"Open reminders: {json.dumps(open_items)}\n"
+              "Decide if the user's message asks to ADD a reminder/task, CANCEL one, mark one DONE, or none of these. "
+              'Return JSON: {"action":"none|add|cancel|done","text":"what to remind, short, second person e.g. call mom","due":"ISO 8601 with +05:30 offset, for add; if no time given use a sensible default (today 09:00 if still ahead else tomorrow 09:00)","repeat":"none|daily","match":"id of the open reminder or text to match, or all"}. '
+              "Only 'add' when he clearly wants to be reminded or wants a task tracked. Casual chat -> none.\n"
+              f"Message: {text}")
+    try:
+        out = json.loads(gemini("You classify messages. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
+        return out if isinstance(out, dict) else None
+    except Exception as e:
+        print("parse_action failed:", e); return None
+
+def do_action(c, chat, text):
+    """Returns a system-note string describing the action result, or None."""
+    if not ACTION_RE.search(text):
+        return None
+    a = parse_action(c, text)
+    if not a or a.get("action") in (None, "none"):
+        return None
+    act = a["action"]
+    with LOCK:
+        if act == "add":
+            try:
+                due = datetime.fromisoformat(a["due"]).astimezone(IST)
+            except Exception:
+                return "ACTION RESULT: he asked for a reminder but the time was unclear. Ask him what time (IST)."
+            if due.timestamp() < time.time() - 60:
+                due += timedelta(days=1)
+            d = {"id": uuid.uuid4().hex[:8], "chat": chat, "text": (a.get("text") or text)[:300], "due": due.timestamp(),
+                 "repeat": "daily" if a.get("repeat") == "daily" else "none", "status": "pending", "nudged": False, "fired_ts": None}
+            c.rem_put(d)
+            return f"ACTION RESULT: reminder set: \"{d['text']}\" for {fmt_ist(d['due'])} IST" + (" (repeats daily)" if d["repeat"] == "daily" else "") + "."
+        items = c.rem_open()
+        m = str(a.get("match") or "").lower()
+        hit = items if m == "all" else [d for d in items if d["id"].startswith(m) or (m and (m in d["text"].lower() or d["text"].lower() in m))]
+        if not hit and act == "done":
+            hit = [d for d in items if d["status"] == "fired"][-1:]
+        if not hit:
+            return f"ACTION RESULT: no matching open reminder found to {act}. Say so and offer to list them."
+        for d in hit:
+            d["status"] = "cancelled" if act == "cancel" else "done"; c.rem_put(d)
+        return f"ACTION RESULT: {'cancelled' if act == 'cancel' else 'marked done'}: " + "; ".join(d["text"] for d in hit) + "."
+
+def list_reminders(c):
+    items = sorted(c.rem_open(), key=lambda d: d["due"])
+    if not items:
+        return "Koi pending reminder nahi hai abhi 🙂"
+    return "\n".join(f"{i+1}. {d['text']} - {fmt_ist(d['due'])}" + (" (daily)" if d["repeat"] == "daily" else "") + (" [fired, waiting for you]" if d["status"] == "fired" else "") for i, d in enumerate(items)) + "\n\nCancel: /cancel <number>"
+
+def scheduler(c):
+    """In-process loop: fires due reminders, follow-up nudges, morning brief. State lives in the DB so restarts are safe."""
+    print("scheduler started")
+    while True:
+        try:
+            now = time.time()
+            chat = c.kv_get("owner_chat")
+            if chat:
+                chat = int(chat)
+                with LOCK:
+                    for d in c.rem_open():
+                        if d["status"] == "pending" and d["due"] <= now:
+                            if now - d["due"] > 6 * 3600 and d["repeat"] != "daily":
+                                late = " (late, sorry - I was offline)"
+                            else:
+                                late = ""
+                            tg("sendMessage", chat_id=d["chat"], text=f"⏰ Reminder: {d['text']}{late}")
+                            if d["repeat"] == "daily":
+                                while d["due"] <= now: d["due"] += 86400
+                            else:
+                                d["status"] = "fired"; d["fired_ts"] = now
+                            c.rem_put(d)
+                        elif d["status"] == "fired" and not d.get("nudged") and d.get("fired_ts") and now - d["fired_ts"] >= NUDGE_AFTER:
+                            tg("sendMessage", chat_id=d["chat"], text=f"Hey, kya \"{d['text']}\" ho gaya? Bata do to main mark kar dungi ✅")
+                            d["nudged"] = True; c.rem_put(d)
+                        elif d["status"] == "fired" and d.get("nudged") and now - d["fired_ts"] > 24 * 3600:
+                            d["status"] = "done"; c.rem_put(d)
+                t = datetime.now(IST)
+                today = t.strftime("%Y-%m-%d")
+                if t.hour >= BRIEF_HOUR and t.hour < 22 and c.kv_get("last_brief") != today:
+                    c.kv_set("last_brief", today)  # set first: never double-send
+                    send_brief(c, chat, t)
+        except Exception as e:
+            print("scheduler error:", repr(e)[:300])
+        time.sleep(20)
+
+def send_brief(c, chat, t):
+    items = sorted(c.rem_open(), key=lambda d: d["due"])
+    todo = [f"{d['text']} ({fmt_ist(d['due'])})" for d in items][:8]
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
+    prompt = (f"Write Sunny's good-morning message. It is {t.strftime('%A, %d %B %Y')} (IST). You are messaging him first, on your own. "
+              f"Pending reminders/tasks: {json.dumps(todo)}. Be warm and personal, use something you remember about him if it fits, "
+              "mention today's reminders briefly if any, ask how he's feeling or what he's up to. 2-4 short sentences, no lists unless needed.")
+    try:
+        msg = gemini(system, [{"role": "user", "parts": [{"text": prompt}]}], search=False)
+    except Exception as e:
+        print("brief gemini failed:", e)
+        msg = "Good morning Sunny ☀️ Aaj ka din kaisa plan hai?"
+    tg("sendMessage", chat_id=chat, text=msg[:3500])
+    c.add_turn(chat, "[system: morning brief sent]", msg)
+
+def reply(c, chat, text, audio=None, note=None):
+    mem = memories(c)
+    system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
+    if note:
+        system += "\n\n" + note
     rows = c.recent(chat, 16)
     # drop repeated model answers (and their user turn) so she can't copy herself
     seen, keep = set(), []
@@ -210,6 +348,7 @@ def handle(c, msg):
     chat, uid, text = msg["chat"]["id"], msg["from"]["id"], msg.get("text")
     if OWNER_ID and str(uid) != OWNER_ID:
         return  # private bot: ignore strangers
+    c.kv_set("owner_chat", chat)  # where proactive messages go
     voice = msg.get("voice") or msg.get("audio")
     if voice and not text:
         tg("sendChatAction", chat_id=chat, action="record_voice")
@@ -223,7 +362,14 @@ def handle(c, msg):
         if mp3:
             try: send_voice(chat, mp3)
             except Exception as e: print("sendVoice failed:", e)
-        extract(c, heard.replace("[voice note] ", ""))
+        said = heard.replace("[voice note] ", "")
+        try:
+            res = do_action(c, chat, said)
+            if res:
+                tg("sendMessage", chat_id=chat, text=gemini(SYSTEM, [{"role": "user", "parts": [{"text": res + " Sunny said (voice): " + said + "\nConfirm in one short warm line."}]}]))
+        except Exception as e:
+            print("voice action failed:", e)
+        extract(c, said)
         return
     if not text:
         return
@@ -232,12 +378,25 @@ def handle(c, msg):
     if text.startswith("/memories"):
         m = memories(c)
         tg("sendMessage", chat_id=chat, text="\n".join(f"{i+1}. {f}" for i, f in enumerate(m)) or "Abhi kuch yaad nahi, batao apne baare mein."); return
+    if text.startswith("/reminders"):
+        tg("sendMessage", chat_id=chat, text=list_reminders(c)); return
+    if text.startswith("/cancel"):
+        items = sorted(c.rem_open(), key=lambda d: d["due"])
+        try:
+            d = items[int(text.split()[1]) - 1]; d["status"] = "cancelled"; c.rem_put(d)
+            tg("sendMessage", chat_id=chat, text=f"Cancelled: {d['text']} ✅")
+        except Exception:
+            tg("sendMessage", chat_id=chat, text="Number batao jaise /cancel 1 (list: /reminders)")
+        return
     if text.startswith("/forget"):
         c.clear_facts()
         tg("sendMessage", chat_id=chat, text="Done, sab bhula diya."); return
     tg("sendChatAction", chat_id=chat, action="typing")
     try:
-        ans, _ = reply(c, chat, text)
+        note = None
+        try: note = do_action(c, chat, text)
+        except Exception as e: print("action failed:", repr(e)[:300])
+        ans, _ = reply(c, chat, text, note=note)
     except Exception as e:
         print("gemini failed:", e)
         ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
@@ -247,6 +406,7 @@ def handle(c, msg):
 def main():
     serve_health()
     c = db()
+    threading.Thread(target=scheduler, args=(c,), daemon=True).start()
     offset = None
     print("KASH is up. memory:", "mongodb" if MONGODB_URI else "local sqlite", flush=True)
     while True:
