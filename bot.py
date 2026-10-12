@@ -22,7 +22,7 @@ SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close f
 - Always respect Sunny. Never rude, never joke at his expense. Be supportive without being clingy or pretending to be human.
 - Be honest. If you don't know or can't do something yet, say so plainly.
 - Use what you remember about him naturally, don't recite it.
-- You are KASH v1: you can chat and remember things. You cannot yet read mail, make calls or control devices."""
+- You are KASH v2: you can chat, remember things, understand his voice notes (and reply to them in your own voice), and look things up on the internet with Google Search when he asks about current or factual things. When you looked something up, say so naturally (for example "maine abhi check kiya" or "just looked it up"). Don't search for casual chat. When he asks you to research, compare, or dig into something, work like a sharp researcher: search several angles, open and read the actual pages or links (also any URL he sends), pull out the concrete facts and numbers, cross-check sources, flag anything uncertain or conflicting, and give a clear, organized answer with the key sources (name + link) listed at the end. Research answers may be longer than usual; keep them skimmable. Never invent facts or sources. You cannot yet read mail, make calls or control devices."""
 
 class SqliteStore:
     def __init__(self, path):
@@ -87,13 +87,56 @@ def post(url, body, timeout=60):
 def tg(method, **kw):
     return post(f"https://api.telegram.org/bot{TG}/{method}", kw, 70)
 
-def gemini(system, contents, json_out=False):
+def gemini(system, contents, json_out=False, search=False):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
     body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
     if json_out:
         body["generationConfig"] = {"responseMimeType": "application/json"}
-    r = post(url, body)
-    return r["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if search and not json_out:
+        body["tools"] = [{"google_search": {}}, {"url_context": {}}]
+    try:
+        r = post(url, body, 120)
+    except urllib.error.HTTPError as e:
+        if not body.get("tools"): raise
+        print("tools rejected, retry with search only:", e.code)
+        body["tools"] = [{"google_search": {}}]
+        r = post(url, body, 120)
+    cand = r["candidates"][0]
+    out = "".join(p.get("text", "") for p in cand["content"]["parts"]).strip()
+    if search:
+        seen, links = set(), []
+        for ch in cand.get("groundingMetadata", {}).get("groundingChunks", []):
+            w = ch.get("web", {})
+            if w.get("uri") and w["uri"] not in seen and len(links) < 4:
+                seen.add(w["uri"]); links.append(f"- {w.get('title','source')}: {w['uri']}")
+        if links and "http" not in out:
+            out += "\n\nSources:\n" + "\n".join(links)
+    return out
+
+def download_voice(file_id):
+    info = tg("getFile", file_id=file_id)["result"]
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG}/{info['file_path']}", timeout=60) as r:
+        return r.read()
+
+def tts_mp3(text):
+    """Female neural voice via edge-tts (free). Returns mp3 bytes or None."""
+    try:
+        import asyncio, edge_tts, tempfile
+        voice = "hi-IN-SwaraNeural" if any("\u0900" <= ch <= "\u097f" for ch in text) else "en-IN-NeerjaNeural"
+        path = tempfile.mktemp(suffix=".mp3")
+        asyncio.run(edge_tts.Communicate(text[:900], voice).save(path))
+        data = open(path, "rb").read(); os.remove(path)
+        return data or None
+    except Exception as e:
+        print("tts failed:", e); return None
+
+def send_voice(chat, data):
+    import uuid
+    b = uuid.uuid4().hex
+    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n"
+            f"--{b}\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"kash.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n").encode() + data + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TG}/sendVoice", body, {"Content-Type": f"multipart/form-data; boundary={b}"})
+    urllib.request.urlopen(req, timeout=60).read()
 
 def memories(c):
     return c.facts()
@@ -112,21 +155,52 @@ def extract(c, user_text):
     except Exception as e:
         print("extract failed:", e)
 
-def reply(c, chat, text):
+def reply(c, chat, text, audio=None):
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     rows = c.recent(chat, 16)
-    contents = [{"role": r, "parts": [{"text": t}]} for r, t in rows] + [{"role": "user", "parts": [{"text": text}]}]
-    ans = gemini(system, contents)
-    c.add_turn(chat, text, ans)
-    return ans
+    contents = [{"role": r, "parts": [{"text": t}]} for r, t in rows]
+    heard = text
+    if audio:
+        import base64
+        contents.append({"role": "user", "parts": [
+            {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(audio).decode()}},
+            {"text": "This is Sunny's voice note. Reply to it as KASH. Format: first line 'HEARD: <short transcript>', then a blank line, then your reply (a short spoken-style reply, plain text, no markdown)."}]})
+    else:
+        contents.append({"role": "user", "parts": [{"text": text}]})
+    ans = gemini(system, contents, search=True)
+    if audio:
+        if ans.startswith("HEARD:"):
+            head, _, rest = ans.partition("\n")
+            heard = head[6:].strip() or "(voice note)"
+            ans = rest.strip() or ans
+        else:
+            heard = "(voice note)"
+        heard = "[voice note] " + heard
+    c.add_turn(chat, heard, ans)
+    return ans, heard
 
 def handle(c, msg):
     chat, uid, text = msg["chat"]["id"], msg["from"]["id"], msg.get("text")
-    if not text:
-        return
     if OWNER_ID and str(uid) != OWNER_ID:
         return  # private bot: ignore strangers
+    voice = msg.get("voice") or msg.get("audio")
+    if voice and not text:
+        tg("sendChatAction", chat_id=chat, action="record_voice")
+        try:
+            ans, heard = reply(c, chat, None, audio=download_voice(voice["file_id"]))
+        except Exception as e:
+            print("voice failed:", e)
+            tg("sendMessage", chat_id=chat, text="Voice note sun nahi paayi, ek baar phir bhejoge? 🙈"); return
+        tg("sendMessage", chat_id=chat, text=ans)
+        mp3 = tts_mp3(ans)
+        if mp3:
+            try: send_voice(chat, mp3)
+            except Exception as e: print("sendVoice failed:", e)
+        extract(c, heard.replace("[voice note] ", ""))
+        return
+    if not text:
+        return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
     if text.startswith("/memories"):
@@ -137,18 +211,18 @@ def handle(c, msg):
         tg("sendMessage", chat_id=chat, text="Done, sab bhula diya."); return
     tg("sendChatAction", chat_id=chat, action="typing")
     try:
-        ans = reply(c, chat, text)
+        ans, _ = reply(c, chat, text)
     except Exception as e:
         print("gemini failed:", e)
         ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
-    tg("sendMessage", chat_id=chat, text=ans)
+    tg("sendMessage", chat_id=chat, text=ans[:4000], disable_web_page_preview=True)
     extract(c, text)
 
 def main():
     serve_health()
     c = db()
     offset = None
-    print("KASH is up. memory:", "mongodb" if MONGODB_URI else "local sqlite")
+    print("KASH is up. memory:", "mongodb" if MONGODB_URI else "local sqlite", flush=True)
     while True:
         try:
             r = tg("getUpdates", timeout=50, **({"offset": offset} if offset else {}))
