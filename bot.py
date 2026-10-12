@@ -1,11 +1,17 @@
-"""KASH v1 - Telegram companion bot. Stdlib only. Long polling, Gemini brain, SQLite memory."""
-import json, os, sqlite3, time, urllib.request, urllib.error
+"""KASH v1 - Telegram companion bot. Stdlib only. Long polling, Gemini brain.
+Memory: Turso (libSQL over HTTPS) when TURSO_DATABASE_URL is set, else a local SQLite file.
+Also serves /health on $PORT so a free host + external pinger can keep it awake."""
+import json, os, sqlite3, threading, time, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TG = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 OWNER_ID = os.environ.get("OWNER_TELEGRAM_ID")  # optional: lock bot to Sunny's Telegram user id
 DB = os.environ.get("KASH_DB", "kash.db")
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+PORT = int(os.environ.get("PORT", "10000"))
 
 SYSTEM = """You are KASH, Sunny's personal AI companion. You are his friend, not a bot or a worker.
 - Talk like a friend texting: warm, casual, short (1-3 sentences). Hinglish is welcome; mirror his language.
@@ -14,11 +20,63 @@ SYSTEM = """You are KASH, Sunny's personal AI companion. You are his friend, not
 - Use what you remember about him naturally, don't recite it.
 - You are KASH v1: you can chat and remember things. You cannot yet read mail, make calls or control devices."""
 
+class TursoDB:
+    """Tiny libSQL-over-HTTP client (stdlib). Same execute/commit shape as sqlite3 for this bot."""
+    def __init__(self, url, token):
+        url = url.replace("libsql://", "https://").replace("turso://", "https://").rstrip("/")
+        self.endpoint, self.token = url + "/v2/pipeline", token
+
+    @staticmethod
+    def _arg(v):
+        if v is None: return {"type": "null"}
+        if isinstance(v, bool): v = int(v)
+        if isinstance(v, int): return {"type": "integer", "value": str(v)}
+        if isinstance(v, float): return {"type": "float", "value": v}
+        return {"type": "text", "value": str(v)}
+
+    @staticmethod
+    def _cell(c):
+        t, v = c.get("type"), c.get("value")
+        if t == "integer": return int(v)
+        if t == "float": return float(v)
+        if t == "null": return None
+        return v
+
+    def execute(self, sql, args=()):
+        body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [self._arg(a) for a in args]}},
+                             {"type": "close"}]}
+        req = urllib.request.Request(self.endpoint, json.dumps(body).encode(),
+                                     {"Content-Type": "application/json", "Authorization": "Bearer " + self.token})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.load(r)["results"][0]
+        if res.get("type") != "ok":
+            raise RuntimeError("turso: " + json.dumps(res.get("error")))
+        return [tuple(self._cell(c) for c in row) for row in res["response"]["result"]["rows"]]
+
+    def commit(self):
+        pass
+
 def db():
-    c = sqlite3.connect(DB)
+    if TURSO_URL:
+        c = TursoDB(TURSO_URL, TURSO_TOKEN)
+    else:
+        c = sqlite3.connect(DB, check_same_thread=False)
     c.execute("CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY, fact TEXT UNIQUE, ts REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, chat INTEGER, role TEXT, text TEXT, ts REAL)")
     return c
+
+class Health(BaseHTTPRequestHandler):
+    def _ok(self, body=True):
+        self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+        if body: self.wfile.write(b"ok")
+    def do_GET(self): self._ok()
+    def do_HEAD(self): self._ok(False)
+    def log_message(self, *a): pass
+
+def serve_health():
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Health)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"health server on :{PORT}")
 
 def post(url, body, timeout=60):
     req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
@@ -90,9 +148,10 @@ def handle(c, msg):
     extract(c, text)
 
 def main():
+    serve_health()
     c = db()
     offset = None
-    print("KASH is up.")
+    print("KASH is up. memory:", "turso" if TURSO_URL else "local sqlite")
     while True:
         try:
             r = tg("getUpdates", timeout=50, **({"offset": offset} if offset else {}))
