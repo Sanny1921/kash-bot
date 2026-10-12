@@ -1,6 +1,8 @@
 """KASH v1 - Telegram companion bot. Stdlib only. Long polling, Gemini brain.
 Memory: MongoDB Atlas (pymongo) when MONGODB_URI is set, else a local SQLite file.
 Also serves /health on $PORT so a free host + external pinger can keep it awake."""
+import builtins, functools
+print = functools.partial(builtins.print, flush=True)
 import json, os, sqlite3, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -90,18 +92,26 @@ def tg(method, **kw):
 def gemini(system, contents, json_out=False, search=False):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
     body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
-    if json_out:
-        body["generationConfig"] = {"responseMimeType": "application/json"}
-    if search and not json_out:
-        body["tools"] = [{"google_search": {}}, {"url_context": {}}]
-    try:
-        r = post(url, body, 120)
-    except urllib.error.HTTPError as e:
-        if not body.get("tools"): raise
-        print("tools rejected, retry with search only:", e.code)
-        body["tools"] = [{"google_search": {}}]
-        r = post(url, body, 120)
-    cand = r["candidates"][0]
+    if json_out: body["generationConfig"] = {"responseMimeType": "application/json"}
+    attempts = [[{"google_search": {}}, {"url_context": {}}], [{"google_search": {}}], None] if (search and not json_out) else [None]
+    r = None
+    for tools_cfg in attempts:
+        if tools_cfg: body["tools"] = tools_cfg
+        else: body.pop("tools", None)
+        try:
+            r = post(url, body, 120)
+            cand = r["candidates"][0]
+            if not cand.get("content", {}).get("parts"):
+                raise ValueError("empty candidate: " + str(cand.get("finishReason")))
+            break
+        except urllib.error.HTTPError as e:
+            print("gemini HTTP", e.code, "tools=", bool(tools_cfg), e.read()[:400])
+            r = None
+        except Exception as e:
+            print("gemini error tools=", bool(tools_cfg), repr(e)[:300])
+            r = None
+    if r is None:
+        raise RuntimeError("all gemini attempts failed")
     out = "".join(p.get("text", "") for p in cand["content"]["parts"]).strip()
     if search:
         seen, links = set(), []
@@ -159,6 +169,18 @@ def reply(c, chat, text, audio=None):
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     rows = c.recent(chat, 16)
+    # drop repeated model answers (and their user turn) so she can't copy herself
+    seen, keep = set(), []
+    for i in range(len(rows) - 1, -1, -1):
+        r, t = rows[i]
+        if r == "model":
+            if t in seen:
+                continue
+            seen.add(t)
+        keep.append(rows[i])
+    rows = keep[::-1]
+    while rows and rows[0][0] != "user":
+        rows = rows[1:]
     contents = [{"role": r, "parts": [{"text": t}]} for r, t in rows]
     heard = text
     if audio:
@@ -169,6 +191,10 @@ def reply(c, chat, text, audio=None):
     else:
         contents.append({"role": "user", "parts": [{"text": text}]})
     ans = gemini(system, contents, search=True)
+    last = [t for r, t in rows if r == "model"][-1:]
+    if not ans or (last and ans.strip() == last[0].strip()):
+        print("repeat/empty answer, regenerating")
+        ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=True) or "Hmm, ek baar phir bolo na? 🙂"
     if audio:
         if ans.startswith("HEARD:"):
             head, _, rest = ans.partition("\n")
