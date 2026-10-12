@@ -3,7 +3,7 @@ services:
     name: kash-bot
     runtime: python
     plan: free
-    buildCommand: "echo no dependencies"
+    buildCommand: pip install -r requirements.txt
     startCommand: python3 bot.py
     healthCheckPath: /health
     envVars:
@@ -15,7 +15,7 @@ services:
         sync: false
       - key: OWNER_TELEGRAM_ID
         sync: false
-      - key: TURSO_DATABASE_URL
+      - key: MONGODB_URI
         sync: false
-      - key: TURSO_AUTH_TOKEN
-        sync: false
+      - key: MONGODB_DB
+        value: kash
