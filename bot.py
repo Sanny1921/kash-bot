@@ -42,6 +42,8 @@ class SqliteStore:
         self.c.execute("INSERT OR IGNORE INTO memories(fact, ts) VALUES(?,?)", (fact, time.time())); self.c.commit()
     def clear_facts(self):
         self.c.execute("DELETE FROM memories"); self.c.commit()
+    def del_fact(self, fact):
+        self.c.execute("DELETE FROM memories WHERE fact=?", (fact,)); self.c.commit()
     def recent(self, chat, n=16):
         return self.c.execute("SELECT role, text FROM history WHERE chat=? ORDER BY id DESC LIMIT ?", (chat, n)).fetchall()[::-1]
     def rem_open(self):
@@ -74,6 +76,8 @@ class MongoStore:
         self.db.memories.update_one({"fact": fact}, {"$setOnInsert": {"fact": fact, "ts": time.time()}}, upsert=True)
     def clear_facts(self):
         self.db.memories.delete_many({})
+    def del_fact(self, fact):
+        self.db.memories.delete_one({"fact": fact})
     def recent(self, chat, n=16):
         docs = list(self.db.history.find({"chat": chat}).sort("ts", -1).limit(n))[::-1]
         return [(d["role"], d["text"]) for d in docs]
@@ -197,19 +201,45 @@ def memories(c):
     return c.facts()
 
 def extract(c, user_text):
-    """Ask Gemini for durable facts about Sunny in his message; store new ones."""
+    """Pick durable facts worth remembering (about Sunny, or defined by him about KASH / their relationship)."""
     known = memories(c)
-    prompt = ("Extract durable facts about the user (name, work, plans, preferences, people, goals) from his message. "
-              "Skip small talk and anything already known. Return a JSON list of short strings, [] if none.\n"
-              f"Already known: {json.dumps(known)}\nMessage: {user_text}")
+    prompt = ("You maintain long-term memory for a personal AI companion named KASH, who talks to Sunny. From Sunny's message, "
+              "extract ONLY durable facts worth remembering for months:\n"
+              "(a) about Sunny: identity, location, work or study, projects, skills, preferences, habits, people in his life (with relationship), goals, important plans or dates;\n"
+              "(b) anything Sunny defines about KASH or their relationship: her name, her personality, how he wants her to talk or behave.\n"
+              "Write each as one short standalone sentence starting with 'Sunny ...' or 'KASH ...' (example: 'Sunny named her KASH').\n"
+              "DO NOT save: one-off requests or questions, research topics, reminders or tasks, test messages, greetings, small talk, passing moods, "
+              "anything already known (even if worded differently), or any instruction about what to ignore or not save. "
+              "Returning [] is better than saving trivia.\n"
+              f"Already known: {json.dumps(known)}\nMessage: {user_text}\nReturn a JSON list of strings.")
     try:
-        out = json.loads(gemini("You extract facts. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
-        for f in out if isinstance(out, list) else []:
-            if isinstance(f, str) and f.strip():
+        out = json.loads(gemini("You extract memories. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
+        for f in (out if isinstance(out, list) else [])[:3]:
+            if isinstance(f, str) and 8 < len(f.strip()) < 200:
                 c.add_fact(f.strip())
     except Exception as e:
         print("extract failed:", e)
 
+def clean_facts(c):
+    """Remove trivia / meta entries from stored memory; keep durable facts about Sunny or defined about KASH."""
+    facts = memories(c)
+    if not facts:
+        return facts
+    prompt = ("Here are stored memories of a personal AI companion. Return a JSON list of the EXACT strings that should be DELETED because they are "
+              "trivia: one-off requests, research topics, reminders/tasks, tests, small talk, passing moods, meta rules about what to ignore, duplicates, "
+              "or not a durable fact. KEEP durable facts about Sunny (identity, work, projects, preferences, people, goals, plans) and anything he defined "
+              f"about KASH (her name, personality, how she should behave). Memories: {json.dumps(facts)}")
+    try:
+        out = json.loads(gemini("You curate memories. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
+        drop = {f for f in out if isinstance(f, str)} if isinstance(out, list) else set()
+        if len(drop) >= len(facts) and len(facts) > 3:
+            return facts  # suspicious: refuse to wipe everything
+        for f in drop & set(facts):
+            c.del_fact(f)
+        return [f for f in facts if f not in drop]
+    except Exception as e:
+        print("clean_facts failed:", e)
+        return facts
 
 ACTION_RE = re.compile(r"remind|reminder|yaad\s*(dila|kara|rakh)|alarm|\btask\b|todo|to-do|cancel|snooze|ho gaya|ho gya|kar liya|\bdone\b|hata do|delete", re.I)
 LOCK = threading.Lock()
@@ -397,8 +427,8 @@ def handle(c, msg):
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
     if text.startswith("/memories"):
-        m = memories(c)
-        tg("sendMessage", chat_id=chat, text="\n".join(f"{i+1}. {f}" for i, f in enumerate(m)) or "Abhi kuch yaad nahi, batao apne baare mein."); return
+        m = clean_facts(c)
+        tg("sendMessage", chat_id=chat, text=("Yeh sab mujhe yaad hai:\n" + "\n".join(f"{i+1}. {f}" for i, f in enumerate(m))) if m else "Abhi kuch khaas yaad nahi, batao apne baare mein 🙂"); return
     if text.startswith("/reminders"):
         tg("sendMessage", chat_id=chat, text=list_reminders(c)); return
     if text.startswith("/cancel"):
