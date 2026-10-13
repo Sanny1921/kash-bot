@@ -15,6 +15,7 @@ DB = os.environ.get("KASH_DB", "kash.db")
 MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 MONGODB_DB = os.environ.get("MONGODB_DB", "kash")
 PORT = int(os.environ.get("PORT", "10000"))
+TTS_MODEL = os.environ.get("TTS_MODEL", "gemini-2.5-flash-preview-tts")
 IST = timezone(timedelta(hours=5, minutes=30))
 BRIEF_HOUR = int(os.environ.get("BRIEF_HOUR", "8"))  # morning brief, IST
 NUDGE_AFTER = 30 * 60  # follow-up nudge after a fired reminder, seconds
@@ -152,17 +153,37 @@ def download_voice(file_id):
     with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG}/{info['file_path']}", timeout=60) as r:
         return r.read()
 
+def tts_gemini(text):
+    """Natural female voice via Gemini TTS (same API key), PCM -> mp3 with lameenc."""
+    import base64, lameenc
+    body = {"contents": [{"parts": [{"text": "Say this warmly and naturally, like a close friend: " + text}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}}}}
+    r = post(f"https://generativelanguage.googleapis.com/v1beta/models/{TTS_MODEL}:generateContent?key={GEMINI_KEY}", body, 90)
+    pcm = base64.b64decode(r["candidates"][0]["content"]["parts"][0]["inlineData"]["data"])
+    e = lameenc.Encoder(); e.set_bit_rate(64); e.set_in_sample_rate(24000); e.set_channels(1); e.set_quality(5)
+    return e.encode(pcm) + e.flush()
+
+def tts_gtts(text):
+    import io
+    from gtts import gTTS
+    lang = "hi" if any("\u0900" <= ch <= "\u097f" for ch in text) else "en"
+    buf = io.BytesIO(); gTTS(text, lang=lang, tld="co.in").write_to_fp(buf)
+    return buf.getvalue()
+
 def tts_mp3(text):
-    """Female neural voice via edge-tts (free). Returns mp3 bytes or None."""
-    try:
-        import asyncio, edge_tts, tempfile
-        voice = "hi-IN-SwaraNeural" if any("\u0900" <= ch <= "\u097f" for ch in text) else "en-IN-NeerjaNeural"
-        path = tempfile.mktemp(suffix=".mp3")
-        asyncio.run(edge_tts.Communicate(text[:900], voice).save(path))
-        data = open(path, "rb").read(); os.remove(path)
-        return data or None
-    except Exception as e:
-        print("tts failed:", e); return None
+    """Female voice mp3: Gemini TTS first, gTTS fallback. Returns bytes or None."""
+    text = text[:900]
+    for name, fn in (("gemini-tts", tts_gemini), ("gtts", tts_gtts)):
+        try:
+            data = fn(text)
+            if data and len(data) > 1000:
+                return data
+        except urllib.error.HTTPError as e:
+            print("tts failed:", name, e.code, e.read()[:200])
+        except Exception as e:
+            print("tts failed:", name, repr(e)[:200])
+    return None
 
 def send_voice(chat, data):
     import uuid
