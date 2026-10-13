@@ -3,6 +3,7 @@ Memory: MongoDB Atlas (pymongo) when MONGODB_URI is set, else a local SQLite fil
 Also serves /health on $PORT so a free host + external pinger can keep it awake."""
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
+import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
 import json, os, re, sqlite3, threading, time, uuid, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,7 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 MONGODB_DB = os.environ.get("MONGODB_DB", "kash")
 PORT = int(os.environ.get("PORT", "10000"))
 TTS_MODEL = os.environ.get("TTS_MODEL", "gemini-2.5-flash-preview-tts")
+USE_GSEARCH = os.environ.get("USE_GEMINI_SEARCH") == "1"  # Gemini google_search tool; the free key has no quota for it
 IST = timezone(timedelta(hours=5, minutes=30))
 BRIEF_HOUR = int(os.environ.get("BRIEF_HOUR", "8"))  # morning brief, IST
 NUDGE_AFTER = 30 * 60  # follow-up nudge after a fired reminder, seconds
@@ -118,11 +120,11 @@ def post(url, body, timeout=60):
 def tg(method, **kw):
     return post(f"https://api.telegram.org/bot{TG}/{method}", kw, 70)
 
-def gemini(system, contents, json_out=False, search=False):
+def gemini(system, contents, json_out=False, search=False, require_search=False):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
     body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
     if json_out: body["generationConfig"] = {"responseMimeType": "application/json"}
-    attempts = [[{"google_search": {}}, {"url_context": {}}], [{"google_search": {}}], None] if (search and not json_out) else [None]
+    attempts = [[{"google_search": {}}, {"url_context": {}}], [{"google_search": {}}]] + ([] if require_search else [None]) if (search and not json_out) else [None]
     r = None
     for tools_cfg in attempts:
         if tools_cfg: body["tools"] = tools_cfg
@@ -331,32 +333,184 @@ def scheduler(c):
                 today = t.strftime("%Y-%m-%d")
                 if t.hour >= BRIEF_HOUR and t.hour < 22 and c.kv_get("last_brief") != today:
                     c.kv_set("last_brief", today)  # set first: never double-send
-                    send_brief(c, chat, t)
+                    threading.Thread(target=send_brief, args=(c, chat, t), daemon=True).start()
+                news_retry(c, chat, t)
         except Exception as e:
             print("scheduler error:", repr(e)[:300])
         time.sleep(20)
 
-def send_brief(c, chat, t):
+def world_news(retries=2):
+    """World brief built from fresh Google News RSS headlines (no Gemini search quota needed)."""
+    topics = [("TECH INDUSTRY", "technology OR AI OR startups OR semiconductor when:1d"),
+              ("MILITARY & DEFENSE", "military OR defense OR war OR army OR missile when:1d"),
+              ("WORLD NEWS", "world news OR international when:1d")]
+    for i in range(retries):
+        try:
+            blocks = []
+            for title, q in topics:
+                items = news_rss(q, 8)
+                blocks.append(title + ":\n" + "\n".join(f"- {t} [{s}] ({d[:16]})" for t, s, d, l in items))
+            if sum(b.count("\n- ") for b in blocks) < 6:
+                raise ValueError("too few headlines")
+            prompt = ("Below are fresh headlines from the last day. Write Sunny's world brief: for each of the three sections, pick the 2-3 most important distinct stories "
+                      "and write one plain line per story with the key fact and the outlet in brackets. Use ONLY these headlines; do not add details, do not guess. "
+                      "Section titles in caps. No markdown symbols. No intro or outro.\n\n" + "\n\n".join(blocks))
+            out = gemini("You are a precise news editor.", [{"role": "user", "parts": [{"text": prompt}]}])
+            if out and len(out) > 200:
+                return out
+        except Exception as e:
+            print("world_news attempt", i + 1, "failed:", repr(e)[:200])
+        time.sleep(15)
+    return None
+
+def day_glance(c, t):
     items = sorted(c.rem_open(), key=lambda d: d["due"])
-    todo = [f"{d['text']} ({fmt_ist(d['due'])})" for d in items][:8]
+    today = t.strftime("%Y-%m-%d")
+    due_today = [d for d in items if datetime.fromtimestamp(d["due"], IST).strftime("%Y-%m-%d") <= today]
+    later = [d for d in items if d not in due_today]
+    lines = [f"- {d['text']} ({datetime.fromtimestamp(d['due'], IST).strftime('%I:%M %p')})" for d in due_today]
+    lines += [f"- (coming up) {d['text']} - {fmt_ist(d['due'])}" for d in later[:4]]
+    return lines
+
+def send_brief(c, chat, t):
     mem = memories(c)
+    glance = day_glance(c, t)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
-    prompt = (f"Write Sunny's good-morning message. It is {t.strftime('%A, %d %B %Y')} (IST). You are messaging him first, on your own. "
-              f"Pending reminders/tasks: {json.dumps(todo)}. Be warm and personal, use something you remember about him if it fits, "
-              "mention today's reminders briefly if any, ask how he's feeling or what he's up to. 2-4 short sentences, no lists unless needed.")
+    prompt = (f"Write Sunny's morning greeting. It is {t.strftime('%A, %d %B %Y')} (IST). You are messaging him first. "
+              "Wake-up energy: a bright, warm good-morning in your friend voice, 1-2 short sentences. Then 'YOUR DAY' as a short section: "
+              f"his reminders/tasks: {json.dumps(glance)}. If empty, say the day is open. Using what you remember about his projects and goals "
+              "(only things in your memory, do not invent), add one or two concrete suggestions for what to focus on today. "
+              "Keep it to about 120 words. Do NOT write any news; that comes separately.")
     try:
         msg = gemini(system, [{"role": "user", "parts": [{"text": prompt}]}], search=False)
     except Exception as e:
         print("brief gemini failed:", e)
-        msg = "Good morning Sunny ☀️ Aaj ka din kaisa plan hai?"
+        msg = "Good morning Sunny ☀️ Uth jao, naya din hai!\n\nYOUR DAY\n" + ("\n".join(glance) or "Din khaali hai, tum decide karo 😄")
     tg("sendMessage", chat_id=chat, text=msg[:3500])
-    c.add_turn(chat, "[system: morning brief sent]", msg)
+    news = world_news()
+    if news:
+        tg("sendMessage", chat_id=chat, text=("🌍 WORLD BRIEF\n\n" + news)[:4000], disable_web_page_preview=True)
+        c.add_turn(chat, "[system: morning brief sent]", msg + "\n\n" + news[:1500])
+    else:
+        tg("sendMessage", chat_id=chat, text="World brief abhi nahi la payi, search thoda busy hai. Thodi der mein phir try karungi 🙏")
+        c.kv_set("news_retry", t.strftime("%Y-%m-%d") + "|0"); c.kv_set("news_retry_ts", time.time())
+        c.add_turn(chat, "[system: morning brief sent]", msg)
+
+def news_retry(c, chat, t):
+    v = c.kv_get("news_retry")
+    if not v or "|" not in v: return
+    day, n = v.split("|"); n = int(n)
+    if day != t.strftime("%Y-%m-%d") or n >= 3: return
+    last = float(c.kv_get("news_retry_ts") or 0)
+    if time.time() - last < 25 * 60: return
+    c.kv_set("news_retry_ts", time.time()); c.kv_set("news_retry", f"{day}|{n+1}")
+    news = world_news(retries=1)
+    if news:
+        c.kv_set("news_retry", f"{day}|9")
+        tg("sendMessage", chat_id=chat, text=("🌍 WORLD BRIEF (late, sorry)\n\n" + news)[:4000], disable_web_page_preview=True)
+
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept-Language": "en-IN,en;q=0.9"}
+
+def http_get(url, timeout=10, data=None, limit=500000):
+    req = urllib.request.Request(url, data=data, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        ctype = r.headers.get("Content-Type", "")
+        raw = r.read(limit)
+    m = re.search(r"charset=([\w-]+)", ctype)
+    return raw.decode(m.group(1) if m else "utf-8", "replace"), ctype
+
+def strip_html(h):
+    h = re.sub(r"(?is)<(script|style|noscript|svg|nav|footer|header|form|iframe).*?</\1>", " ", h)
+    t = re.sub(r"(?s)<[^>]+>", " ", h)
+    return re.sub(r"\s+", " ", htmlmod.unescape(t)).strip()
+
+def ddg_search(q, n=6):
+    body, _ = http_get("https://html.duckduckgo.com/html/", data=urllib.parse.urlencode({"q": q}).encode())
+    out = []
+    for m in re.finditer(r'(?s)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?(?:class="result__snippet"[^>]*>(.*?)</a>)?', body):
+        url = htmlmod.unescape(m.group(1))
+        if "uddg=" in url:
+            url = urllib.parse.unquote(url.split("uddg=")[1].split("&")[0])
+        if url.startswith("//"): url = "https:" + url
+        if not url.startswith("http") or "duckduckgo.com/y.js" in url: continue
+        out.append((strip_html(m.group(2)), url, strip_html(m.group(3) or "")))
+        if len(out) >= n: break
+    return out
+
+def fetch_text(url, maxc=3500):
+    try:
+        body, ctype = http_get(url, timeout=9)
+        if "html" not in ctype and "text" not in ctype: return ""
+        return strip_html(body)[:maxc]
+    except Exception as e:
+        print("fetch failed", url[:80], repr(e)[:80]); return ""
+
+def news_rss(q, n=7):
+    body, _ = http_get("https://news.google.com/rss/search?q=" + urllib.parse.quote(q) + "&hl=en-IN&gl=IN&ceid=IN:en")
+    out = []
+    for it in ET.fromstring(body).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(" - " + src): title = title[: -len(src) - 3]
+        out.append((title, src, it.findtext("pubDate") or "", it.findtext("link") or ""))
+        if len(out) >= n: break
+    return out
+
+WEB_RE = re.compile(r"research|search|look\s*up|find out|google|latest|news|khabar|today|current|right now|price|kitna|cost|compare|\bvs\b|review|\bbest\b|\btop\b|who is|what is|kya hai|update|score|weather|release|launch|http", re.I)
+
+def web_context(text):
+    """Search the web + read the top pages; returns a context block with sources, or None."""
+    urls = re.findall(r"https?://\S+", text)
+    q = None
+    if not urls or len(text) > 60:
+        try:
+            q = gemini(f"Turn the message into ONE concise English web search query (max 10 words). Today is {datetime.now(IST).strftime('%d %B %Y')}; if a year matters use the current year, otherwise do not add a year. Output only the query.",
+                       [{"role": "user", "parts": [{"text": text[:500]}]}]).strip().strip('"')[:150]
+        except Exception as e:
+            print("query gen failed:", repr(e)[:100])
+        q = q or re.sub(r"https?://\S+", "", text)[:150].strip()
+    pages = [(u.rstrip(").,"), "link he sent") for u in urls[:2]]
+    results = []
+    if q:
+        try:
+            results = ddg_search(q)
+        except Exception as e:
+            print("ddg failed:", repr(e)[:120])
+        if len(results) < 2:
+            try:
+                results += [(t, l, f"{s} {d}") for t, s, d, l in news_rss(q, 5)]
+            except Exception as e:
+                print("news rss failed:", repr(e)[:120])
+    for t, u, sn in results[:3]:
+        pages.append((u, t))
+    texts = {}
+    def grab(u): texts[u] = fetch_text(u)
+    th = [threading.Thread(target=grab, args=(u,)) for u, _ in pages]
+    [x.start() for x in th]; [x.join(12) for x in th]
+    if not results and not any(texts.values()):
+        return None
+    parts = [f"WEB RESEARCH done just now for query: {q!r}. Use it; cite source names with links; if it conflicts or is thin, say so. Do not invent beyond it."]
+    for t, u, sn in results[:6]:
+        parts.append(f"- {t} | {u} | {sn[:200]}")
+    for u, t in pages:
+        if texts.get(u):
+            parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
+    return "\n".join(parts)[:14000]
 
 def reply(c, chat, text, audio=None, note=None):
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     if note:
         system += "\n\n" + note
+    if text and not audio and WEB_RE.search(text):
+        try:
+            ctx = web_context(text)
+            if ctx:
+                system += "\n\n" + ctx
+            else:
+                system += "\n\nNote: you tried to look this up on the web just now but the search returned nothing. Say so honestly and answer only from what you already know, flagged as possibly outdated."
+        except Exception as e:
+            print("web_context failed:", repr(e)[:200])
     rows = c.recent(chat, 16)
     # drop repeated model answers (and their user turn) so she can't copy herself
     seen, keep = set(), []
@@ -379,11 +533,11 @@ def reply(c, chat, text, audio=None, note=None):
             {"text": "This is Sunny's voice note. Reply to it as KASH. Format: first line 'HEARD: <short transcript>', then a blank line, then your reply (a short spoken-style reply, plain text, no markdown)."}]})
     else:
         contents.append({"role": "user", "parts": [{"text": text}]})
-    ans = gemini(system, contents, search=True)
+    ans = gemini(system, contents, search=USE_GSEARCH)
     last = [t for r, t in rows if r == "model"][-1:]
     if not ans or (last and ans.strip() == last[0].strip()):
         print("repeat/empty answer, regenerating")
-        ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=True) or "Hmm, ek baar phir bolo na? 🙂"
+        ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=USE_GSEARCH) or "Hmm, ek baar phir bolo na? 🙂"
     if audio:
         if ans.startswith("HEARD:"):
             head, _, rest = ans.partition("\n")
