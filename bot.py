@@ -340,28 +340,38 @@ def scheduler(c):
         time.sleep(20)
 
 def world_news(retries=2):
-    """World brief built from fresh Google News RSS headlines (no Gemini search quota needed)."""
+    """Build a brief from fetched Google News RSS headlines; never invent or pad stories."""
     topics = [("TECH INDUSTRY", "technology OR AI OR startups OR semiconductor when:1d"),
               ("MILITARY & DEFENSE", "military OR defense OR war OR army OR missile when:1d"),
-              ("WORLD NEWS", "world news OR international when:1d")]
-    for i in range(retries):
+              ("WORLD NEWS", "world news OR international when:1d"),
+              ("INDIA", None),
+              ("PATNA & BIHAR", "Patna OR Bihar when:1d")]
+    blocks = []
+    for title, q in topics:
         try:
-            blocks = []
-            for title, q in topics:
-                items = news_rss(q, 8)
-                blocks.append(title + ":\n" + "\n".join(f"- {t} [{s}] ({d[:16]})" for t, s, d, l in items))
-            if sum(b.count("\n- ") for b in blocks) < 6:
-                raise ValueError("too few headlines")
-            prompt = ("Below are fresh headlines from the last day. Write Sunny's world brief: for each of the three sections, pick the 2-3 most important distinct stories "
-                      "and write one plain line per story with the key fact and the outlet in brackets. Use ONLY these headlines; do not add details, do not guess. "
-                      "Section titles in caps. No markdown symbols. No intro or outro.\n\n" + "\n\n".join(blocks))
-            out = gemini("You are a precise news editor.", [{"role": "user", "parts": [{"text": prompt}]}])
-            if out and len(out) > 200:
-                return out
+            items = news_rss(q, 8)
         except Exception as e:
-            print("world_news attempt", i + 1, "failed:", repr(e)[:200])
-        time.sleep(15)
-    return None
+            print("news rss failed for", title, repr(e)[:160])
+            items = []
+        stories = []
+        seen = set()
+        for headline, outlet, published, link in items:
+            headline = headline.strip()
+            outlet = outlet.strip()
+            if not headline or not outlet or headline.lower() in seen:
+                continue
+            seen.add(headline.lower())
+            if headline.endswith(" - " + outlet):
+                headline = headline[: -len(outlet) - 3]
+            stories.append(f"- {headline} [{outlet}]")
+            if len(stories) == 3:
+                break
+        if not stories:
+            stories = ["- No fresh headlines were returned by this feed."]
+        elif len(stories) == 1:
+            stories.append("- Only 1 fresh story was returned by this feed.")
+        blocks.append(title + ":\n" + "\n".join(stories))
+    return "\n\n".join(blocks)
 
 def day_glance(c, t):
     items = sorted(c.rem_open(), key=lambda d: d["due"])
@@ -446,7 +456,13 @@ def fetch_text(url, maxc=3500):
         print("fetch failed", url[:80], repr(e)[:80]); return ""
 
 def news_rss(q, n=7):
-    body, _ = http_get("https://news.google.com/rss/search?q=" + urllib.parse.quote(q) + "&hl=en-IN&gl=IN&ceid=IN:en")
+    base = "https://news.google.com/rss"
+    if q:
+        url = base + "/search?q=" + urllib.parse.quote(q)
+    else:
+        url = base
+    url += "&hl=en-IN&gl=IN&ceid=IN:en"
+    body, _ = http_get(url)
     out = []
     for it in ET.fromstring(body).iter("item"):
         title = (it.findtext("title") or "").strip()
