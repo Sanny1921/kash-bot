@@ -498,11 +498,24 @@ def web_context(text):
     return "\n".join(parts)[:14000]
 
 def reply(c, chat, text, audio=None, note=None):
+    # Transcribe voice first so the exact same research gate and lookup used for
+    # typed messages can run before KASH answers. Do not answer from model memory
+    # when the voice transcription itself failed.
+    if audio:
+        import base64
+        tx = gemini(SYSTEM, [{"role": "user", "parts": [
+            {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(audio).decode()}},
+            {"text": "Transcribe this voice note verbatim in its original language. Return only the words spoken, with no label, answer, or commentary."}
+        ]}]).strip()
+        if not tx:
+            raise ValueError("empty voice transcription")
+        text = tx
+
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     if note:
         system += "\n\n" + note
-    if text and not audio and WEB_RE.search(text):
+    if text and WEB_RE.search(text):
         try:
             ctx = web_context(text)
             if ctx:
@@ -511,6 +524,7 @@ def reply(c, chat, text, audio=None, note=None):
                 system += "\n\nNote: you tried to look this up on the web just now but the search returned nothing. Say so honestly and answer only from what you already know, flagged as possibly outdated."
         except Exception as e:
             print("web_context failed:", repr(e)[:200])
+            system += "\n\nNote: you tried to look this up on the web but the lookup failed. Say so honestly and answer only from what you already know, flagged as possibly outdated."
     rows = c.recent(chat, 16)
     # drop repeated model answers (and their user turn) so she can't copy herself
     seen, keep = set(), []
@@ -527,10 +541,9 @@ def reply(c, chat, text, audio=None, note=None):
     contents = [{"role": r, "parts": [{"text": t}]} for r, t in rows]
     heard = text
     if audio:
-        import base64
-        contents.append({"role": "user", "parts": [
-            {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(audio).decode()}},
-            {"text": "This is Sunny's voice note. Reply to it as KASH. Format: first line 'HEARD: <short transcript>', then a blank line, then your reply (a short spoken-style reply, plain text, no markdown)."}]})
+        contents.append({"role": "user", "parts": [{"text":
+            "Sunny sent a voice note. Its transcript is: " + text +
+            "\nReply as KASH in a short, spoken-style way, plain text, no markdown. Do not repeat the transcript."}]})
     else:
         contents.append({"role": "user", "parts": [{"text": text}]})
     ans = gemini(system, contents, search=USE_GSEARCH)
@@ -539,13 +552,7 @@ def reply(c, chat, text, audio=None, note=None):
         print("repeat/empty answer, regenerating")
         ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=USE_GSEARCH) or "Hmm, ek baar phir bolo na? 🙂"
     if audio:
-        if ans.startswith("HEARD:"):
-            head, _, rest = ans.partition("\n")
-            heard = head[6:].strip() or "(voice note)"
-            ans = rest.strip() or ans
-        else:
-            heard = "(voice note)"
-        heard = "[voice note] " + heard
+        heard = "[voice note] " + text
     c.add_turn(chat, heard, ans)
     return ans, heard
 
