@@ -1,6 +1,7 @@
 """KASH v1 - Telegram companion bot. Stdlib only. Long polling, Gemini brain.
 Memory: MongoDB Atlas (pymongo) when MONGODB_URI is set, else a local SQLite file.
 Also serves /health on $PORT so a free host + external pinger can keep it awake."""
+import gmail_link
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -31,7 +32,7 @@ SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close f
 - Always respect Sunny. Never rude, never joke at his expense. Be supportive without being clingy or pretending to be human.
 - Be honest. If you don't know or can't do something yet, say so plainly.
 - Use what you remember about him naturally, don't recite it.
-- You are KASH v2: you can chat, remember things, understand his voice notes (and reply to them in your own voice), and look things up on the internet with Google Search when he asks about current or factual things. When you looked something up, say so naturally (for example "maine abhi check kiya" or "just looked it up"). Don't search for casual chat. When he asks you to research, compare, or dig into something, work like a sharp researcher: search several angles, open and read the actual pages or links (also any URL he sends), pull out the concrete facts and numbers, cross-check sources, flag anything uncertain or conflicting, and give a clear, organized answer with the key sources (name + link) listed at the end. Research answers may be longer than usual; keep them skimmable. Never invent facts or sources. You are KASH v3: you can also set reminders for him, and you message him first (morning brief, reminder pings, gentle follow-ups). When a system note tells you an action result (reminder set, cancelled, done), confirm it warmly in one short line, mentioning the time in IST. Never claim you set a reminder unless a system note says so. You cannot yet read mail, make calls or control devices."""
+- You are KASH v2: you can chat, remember things, understand his voice notes (and reply to them in your own voice), and look things up on the internet with Google Search when he asks about current or factual things. When you looked something up, say so naturally (for example "maine abhi check kiya" or "just looked it up"). Don't search for casual chat. When he asks you to research, compare, or dig into something, work like a sharp researcher: search several angles, open and read the actual pages or links (also any URL he sends), pull out the concrete facts and numbers, cross-check sources, flag anything uncertain or conflicting, and give a clear, organized answer with the key sources (name + link) listed at the end. Research answers may be longer than usual; keep them skimmable. Never invent facts or sources. You are KASH v3: you can also set reminders for him, and you message him first (morning brief, reminder pings, gentle follow-ups). When a system note tells you an action result (reminder set, cancelled, done), confirm it warmly in one short line, mentioning the time in IST. Never claim you set a reminder unless a system note says so. You can show recent non-sensitive Gmail sender and subject in the morning brief when connected. /gmail connects Gmail, /gmailtest previews the mail section, /gmaildisconnect removes access. You cannot send email, make calls or control devices."""
 
 class SqliteStore:
     def __init__(self, path):
@@ -103,12 +104,23 @@ class Health(BaseHTTPRequestHandler):
     def _ok(self, body=True):
         self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
         if body: self.wfile.write(b"ok")
-    def do_GET(self): self._ok()
+    def do_GET(self):
+        if urllib.parse.urlsplit(self.path).path == "/privacy":
+            text = ("KASH is Sunny Tiwari's private personal assistant. Gmail access is read-only. "
+                    "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
+                    "does not fetch bodies or attachments, does not send mail or mark it as read, and does not send mail to an AI model. "
+                    "An encrypted refresh token is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
+                    "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect to remove KASH's stored token "
+                    "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
+            self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
+            self.wfile.write(text.encode()); return
+        if not gmail_link.handle_http(self, self.server.store): self._ok()
     def do_HEAD(self): self._ok(False)
     def log_message(self, *a): pass
 
-def serve_health():
+def serve_health(c):
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Health)
+    srv.store = c
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"health server on :{PORT}")
 
@@ -397,6 +409,8 @@ def send_brief(c, chat, t):
         print("brief gemini failed:", e)
         msg = "Good morning Sunny ☀️ Uth jao, naya din hai!\n\nYOUR DAY\n" + ("\n".join(glance) or "Din khaali hai, tum decide karo 😄")
     tg("sendMessage", chat_id=chat, text=msg[:3500])
+    mail = gmail_link.brief(c)
+    tg("sendMessage", chat_id=chat, text=mail[:4000], disable_web_page_preview=True)
     news = world_news()
     if news:
         tg("sendMessage", chat_id=chat, text=("🌍 WORLD BRIEF\n\n" + news)[:4000], disable_web_page_preview=True)
@@ -576,6 +590,10 @@ def handle(c, msg):
     chat, uid, text = msg["chat"]["id"], msg["from"]["id"], msg.get("text")
     if OWNER_ID and str(uid) != OWNER_ID:
         return  # private bot: ignore strangers
+    # Never let another Telegram user change the owner or access Gmail.
+    saved_owner = c.kv_get("owner_chat")
+    if not OWNER_ID and saved_owner and str(chat) != str(saved_owner): return
+    if msg["chat"].get("type") != "private": return
     c.kv_set("owner_chat", chat)  # where proactive messages go
     voice = msg.get("voice") or msg.get("audio")
     if voice and not text:
@@ -603,6 +621,17 @@ def handle(c, msg):
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
+    if text.split()[0].split("@")[0] in ("/gmail", "/gmailtest", "/gmaildisconnect"):
+        command = text.split()[0].split("@")[0]
+        if command == "/gmaildisconnect":
+            gmail_link.disconnect(c)
+            ans = "Gmail disconnected. I won't read it for your brief."
+        elif command == "/gmailtest":
+            ans = gmail_link.brief(c)
+        else:
+            link = gmail_link.connect_link(c)
+            ans = ("Connect " + gmail_link.EMAIL + " for your 8am mail section. Read-only: sender + subject, no bodies or attachments, no sends or marking mail as read. Bank, DigiLocker and security mail are excluded. This private link expires in 30 minutes.\n" + link) if link else "Gmail setup is not ready yet."
+        tg("sendMessage", chat_id=chat, text=ans[:4000], disable_web_page_preview=True); return
     if text.startswith("/memories"):
         m = clean_facts(c)
         tg("sendMessage", chat_id=chat, text=("Yeh sab mujhe yaad hai:\n" + "\n".join(f"{i+1}. {f}" for i, f in enumerate(m))) if m else "Abhi kuch khaas yaad nahi, batao apne baare mein 🙂"); return
@@ -632,8 +661,8 @@ def handle(c, msg):
     extract(c, text)
 
 def main():
-    serve_health()
     c = db()
+    serve_health(c)
     threading.Thread(target=scheduler, args=(c,), daemon=True).start()
     offset = None
     print("KASH is up. memory:", "mongodb" if MONGODB_URI else "local sqlite", flush=True)
