@@ -114,15 +114,19 @@ class Health(BaseHTTPRequestHandler):
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
             self.wfile.write(text.encode()); return
+        if urllib.parse.urlsplit(self.path).path in ("/gmail/connect", "/gmail/callback") and self.server.store is None:
+            self.send_response(503); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(b"KASH is starting. Please try again shortly."); return
         if not gmail_link.handle_http(self, self.server.store): self._ok()
     def do_HEAD(self): self._ok(False)
     def log_message(self, *a): pass
 
-def serve_health(c):
+def serve_health(c=None):
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Health)
     srv.store = c
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"health server on :{PORT}")
+    return srv
 
 def post(url, body, timeout=60):
     req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
@@ -661,8 +665,9 @@ def handle(c, msg):
     extract(c, text)
 
 def main():
+    srv = serve_health()
     c = db()
-    serve_health(c)
+    srv.store = c
     threading.Thread(target=scheduler, args=(c,), daemon=True).start()
     offset = None
     print("KASH is up. memory:", "mongodb" if MONGODB_URI else "local sqlite", flush=True)
