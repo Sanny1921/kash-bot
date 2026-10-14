@@ -1,3 +1,5 @@
 pymongo[srv]>=4.6
 lameenc>=1.7
 gTTS>=2.5
+
+cryptography>=43.0
