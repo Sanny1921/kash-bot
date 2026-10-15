@@ -189,3 +189,72 @@ def handle_http(handler,c):
     handler.send_response(200); handler.send_header('Content-Type','text/plain; charset=utf-8')
     handler.send_header('Cache-Control','no-store'); handler.send_header('Referrer-Policy','no-referrer')
     handler.end_headers(); handler.wfile.write(text.encode()); return True
+
+# Content reads are explicit user-requested actions, separate from the header-only morning brief.
+def body_text(payload):
+    if payload.get('filename') or payload.get('body',{}).get('attachmentId'): return ''
+    kind = payload.get('mimeType','')
+    if kind.startswith('multipart/'):
+        parts = payload.get('parts',[])
+        plain = [p for p in parts if p.get('mimeType')=='text/plain' and not p.get('filename')]
+        return '\n'.join(body_text(p) for p in (plain or parts))
+    if kind not in ('text/plain','text/html'): return ''
+    data = payload.get('body',{}).get('data','')
+    if not data: return ''
+    text = base64.urlsafe_b64decode(data + '='*(-len(data)%4)).decode('utf-8','replace')
+    if kind=='text/html':
+        import html
+        text = re.sub(r'(?is)<(script|style).*?</\1>',' ',text)
+        text = html.unescape(re.sub(r'<[^>]+>',' ',text))
+    return re.sub(r'\s+',' ',text).strip()[:12000]
+
+def account_content(email, encrypted, query):
+    try:
+        refresh = cipher().decrypt(encrypted.encode()).decode()
+        token = request_json('https://oauth2.googleapis.com/token',{
+            'client_id':os.environ['GMAIL_CLIENT_ID'],'client_secret':os.environ['GMAIL_CLIENT_SECRET'],
+            'refresh_token':refresh,'grant_type':'refresh_token'})['access_token']
+        api = 'https://gmail.googleapis.com/gmail/v1/users/me/messages'
+        # Gmail's search applies exclusions to indexed bodies BEFORE a full-content fetch.
+        listing = request_json(api+'?'+urllib.parse.urlencode({'q':query,'maxResults':12}),token=token)
+        candidates=[]
+        for item in listing.get('messages',[]):
+            params=[('format','metadata'),('metadataHeaders','From'),('metadataHeaders','Subject'),('fields','payload/headers,labelIds,internalDate')]
+            m=request_json(api+'/'+item['id']+'?'+urllib.parse.urlencode(params),token=token)
+            h={v['name'].lower():v['value'] for v in m.get('payload',{}).get('headers',[])}
+            subject,sender=h.get('subject','(no subject)'),h.get('from','')
+            if SENSITIVE.search(subject+' '+sender): continue
+            candidates.append(('IMPORTANT' in m.get('labelIds',[]) or bool(IMPORTANT.search(subject)),int(m.get('internalDate',0)),item['id'],sender,subject))
+        candidates.sort(reverse=True)
+        docs=[]
+        for priority,ts,mid,sender,subject in candidates[:3]:
+            m=request_json(api+'/'+mid+'?'+urllib.parse.urlencode({'format':'full','fields':'payload,internalDate'}),token=token)
+            text=body_text(m.get('payload',{}))
+            # Defense in depth: never surface text that escaped Gmail's search exclusions.
+            if SENSITIVE.search(text):continue
+            if not text:continue
+            docs.append({'account':email,'sender':safe_text(sender,200),'subject':safe_text(subject,250),'received_ms':ts,'body':text[:6000]})
+        return docs,None
+    except urllib.error.HTTPError as e:
+        if e.code in (401,403): return [],email+': access could not be used; check /gmailaccounts and reconnect only if Google permission expired or was blocked.'
+        return [],email+': Gmail request failed this time; this does not mean no mail exists.'
+    except Exception:
+        return [],email+': could not fetch mail this time; the saved connection was not removed.'
+
+def content(c, question):
+    saved=accounts(c)
+    if not configured() or not saved:return [],['No Gmail account connected. Use /gmail youraddress@gmail.com.']
+    query=QUERY
+    # A quoted sender/subject phrase narrows the search without accepting Gmail operators.
+    phrases=re.findall(r'["\u201c]([^"\u201d]{2,80})["\u201d]',question)
+    if phrases:
+        phrase=re.sub(r'[^\w @.\-]',' ',phrases[0]).strip()
+        if phrase:query=QUERY.replace('newer_than:1d','newer_than:30d')+' "'+phrase+'"'
+    docs,notices=[],[]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results=list(pool.map(lambda pair:account_content(*pair,query),sorted(saved.items())))
+    for found,error in results:
+        docs.extend(found)
+        if error:notices.append(error)
+    docs.sort(key=lambda d:d['received_ms'],reverse=True)
+    return docs[:8],notices
