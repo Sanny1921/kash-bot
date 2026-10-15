@@ -5,6 +5,7 @@ import gmail_link
 import calendar_link
 import drive_link
 import contacts_link
+import tasks_link
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -113,7 +114,7 @@ class Health(BaseHTTPRequestHandler):
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
                     "reads non-sensitive email bodies on request and sends selected message text to the configured Gemini model for a summary. It skips attachments, sensitive mail, sending and marking mail as read. Eligible reply drafts also use the configured Gemini model. Each connected account has its own Google consent; the brief labels mail by account. Mail-content questions use live content with sensitive-mail filtering. Optional compose consent enables reply drafts in Gmail, never sending; read access remains available without compose consent. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
-                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Tasks are not active until implemented. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
+                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
@@ -287,7 +288,7 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
-    if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text)):return None
+    if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text) or GOOGLE_TASK_TOPIC.search(text)):return None
     """Returns a system-note string describing the action result, or None."""
     if not ACTION_RE.search(text):
         return None
@@ -548,6 +549,67 @@ def web_context(text):
             parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
     return "\n".join(parts)[:14000]
 
+GOOGLE_TASK_TOPIC=re.compile(r'google tasks|task lists|my tasks|मेरे टास्क',re.I)
+
+def tasks_capability(c):
+    return 'Google Tasks is read/create only. /tasklists shows lists, /taskuse NUMBER selects one, /tasks reads its pending tasks, /taskadd TITLE then optional notes and Due: YYYY-MM-DD previews a new task. /taskconfirm CODE creates it. No completing, editing, deleting or assigning tasks. Task due dates have no time/reminder alarm.' if drive_link.accounts(c) else 'Connect the Google suite first: /google youraddress@gmail.com.'
+
+def tasks_command(c,text,chat):
+    if not drive_link.accounts(c):return tasks_capability(c)
+    parts=text.split(maxsplit=1);cmd=parts[0].split('@')[0].lower();arg=parts[1].strip() if len(parts)>1 else ''
+    try:
+        if cmd=='/tasklists':
+            rows,notices=tasks_link.lists(c);c.kv_set('task_choices_'+str(chat),json.dumps({'until':time.time()+900,'rows':rows}))
+            return '\n'.join(['Google task lists:']+[str(i)+'. ['+r['account']+'] '+gmail_link.safe_text(r.get('title','Task list'),180) for i,r in enumerate(rows,1)]+notices+['Choose /taskuse NUMBER before reading or adding tasks.'])
+        if cmd=='/taskuse':
+            choices=json.loads(c.kv_get('task_choices_'+str(chat)) or '{}')
+            if choices.get('until',0)<time.time():return 'Run /tasklists for a current list first.'
+            n=int(arg)-1
+            if n<0 or n>=len(choices.get('rows',[])):return 'Choose a number from /tasklists.'
+            dest=choices['rows'][n];live,notices=tasks_link.lists(c)
+            if not any(v['account']==dest['account'] and v['id']==dest['id'] for v in live):return 'That list is unavailable. Run /tasklists again.'
+            c.kv_set('task_destination_'+str(chat),json.dumps(dest));return 'Selected ['+dest['account']+'] '+gmail_link.safe_text(dest.get('title','Task list'),180)+'. Use /tasks or /taskadd TITLE.'
+        dest=json.loads(c.kv_get('task_destination_'+str(chat)) or '{}')
+        if not dest:return 'Choose a Google task list first: /tasklists, then /taskuse NUMBER.'
+        if cmd=='/tasks':
+            rows,more=tasks_link.tasks(c,dest['account'],dest['id'])
+            lines=['Pending Google Tasks ['+dest['account']+'] '+gmail_link.safe_text(dest.get('title','Task list'),180)+':']
+            for r in rows:lines.append('- '+gmail_link.safe_text(r.get('title','(untitled)'),250)+(' | due '+r['due'][:10] if r.get('due') else ''))
+            if not rows:lines.append('No pending tasks returned.')
+            if more:lines.append('Showing first 100 pending tasks; check Google Tasks for more.')
+            return '\n'.join(lines)
+        if cmd=='/taskadd':
+            lines=arg.splitlines();title=lines[0].strip()[:1024] if lines else ''
+            if not title:return 'Use /taskadd TITLE, with optional notes and a line Due: YYYY-MM-DD.'
+            notes=[];due=None
+            for line in lines[1:]:
+                if re.match(r'^due:',line,re.I):
+                    value=line.split(':',1)[1].strip()
+                    date=datetime.strptime(value,'%Y-%m-%d').date()
+                    if date<datetime.now(IST).date():return 'That due date is in the past. Please confirm an exact current/future date in a new request.'
+                    due=date.isoformat()+'T00:00:00.000Z'
+                else:notes.append(line)
+            body={'title':title}
+            if notes:body['notes']='\n'.join(notes)[:5000]
+            if due:body['due']=due
+            code=__import__('secrets').token_hex(4)
+            c.kv_set('task_pending_'+str(chat),json.dumps({'code':code,'until':time.time()+900,'dest':dest,'body':body}))
+            return 'Review NEW Google task:\nAccount/list: ['+dest['account']+'] '+gmail_link.safe_text(dest.get('title','Task list'),180)+'\n'+title+('\nNotes: '+body['notes'] if body.get('notes') else '')+('\nDue date: '+due[:10]+' (date only; no alarm)' if due else '\nNo due date or alarm')+'\nNothing created yet. Use /taskconfirm '+code+' within 15 minutes to create this task.'
+        if cmd=='/taskconfirm':
+            pending=json.loads(c.kv_get('task_pending_'+str(chat)) or '{}')
+            if pending.get('code')!=arg or pending.get('until',0)<time.time():return 'That task preview expired or is invalid. Prepare a new preview.'
+            d=pending['dest'];result=tasks_link.create(c,d['account'],d['id'],pending['body'],'task_creation_'+str(chat)+'_'+arg)
+            if result['status']=='created':return 'Created in ['+d['account']+'] '+gmail_link.safe_text(d.get('title','Task list'),180)+'. I read it back and checked it. No existing task changed. Task dates are date-only, not reminder alarms.'+('\n'+result['url'] if result.get('url') else '\nOpen Google Tasks or use /tasks to see it.')
+            if result['status']=='partial':return 'A new task exists, but its details did not fully match the readback. Check Google Tasks before using it. No automatic retry.'
+            return 'Task creation could not be confirmed. Check Google Tasks before adding it again. I will not retry this confirmation and risk a duplicate.'
+        return tasks_capability(c)
+    except Exception:return 'Could not complete that Google Tasks request. Check the command, exact date, chosen list and suite consent. No existing task was intentionally changed.'
+
+def live_tasks_answer(c,text,chat):
+    if not text or not GOOGLE_TASK_TOPIC.search(text):return None
+    if re.search(r'add|create|edit|delete|complete|finish|remove|assign',text,re.I):return tasks_capability(c)
+    return tasks_command(c,'/tasks',chat)
+
 CONTACT_TOPIC=re.compile(r'find.*contact|look.*contact|contact.*(?:number|email|details)|(?:phone number|email address) (?:for|of)|कॉन्टैक्ट',re.I)
 
 def contact_capability(c):
@@ -666,6 +728,13 @@ def calendar_capability(c):
 def calendar_command(c,text,chat):
     parts=text.split();cmd=parts[0].split('@')[0].lower()
     try:
+        if cmd=='/googledisconnect':
+            email=parts[1].lower() if len(parts)>1 else ''
+            suite=drive_link.accounts(c)
+            if email not in suite:return 'Remove one suite connection locally: /googledisconnect fulladdress@gmail.com. Existing Gmail tokens stay unchanged.'
+            suite.pop(email);c.kv_set('workspace_accounts',json.dumps(suite))
+            calendars=calendar_link.accounts(c);calendars.pop(email,None);c.kv_set('calendar_accounts',json.dumps(calendars))
+            return 'Google suite connection removed locally for '+email+'. Existing Gmail tokens are unchanged. Revoke the project on Google only if you also want to affect its Gmail permission.'
         if cmd in ('/calendar','/google'):
             if len(parts)!=2 or not gmail_link.valid_email(parts[1]):return 'Connect Calendar: /calendar youraddress@gmail.com. Each account approves separately; Gmail stays unchanged.'
             link=calendar_link.connect_link(c,parts[1])
@@ -861,6 +930,11 @@ def reply(c, chat, text, audio=None, note=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    task_answer=live_tasks_answer(c,text,chat)
+    if task_answer is not None:
+        heard="[voice note] "+text if audio else text
+        c.add_turn(chat,heard,"[Live Google Tasks request handled separately; task data not saved in conversation history.]")
+        return task_answer,heard
     contact_answer=live_contact_answer(c,text,chat)
     if contact_answer is not None:
         heard="[voice note] "+text if audio else text
@@ -887,6 +961,7 @@ def reply(c, chat, text, audio=None, note=None):
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     connected_count = len(gmail_link.accounts(c))
     system += "\n\nCURRENT GMAIL CAPABILITY, authoritative over memory and old chat: " + mail_capability(c) + " Never deny inbox access while an account is connected. Do not ask the user to paste or copy email text. Non-sensitive email bodies can be read and summarized through the live Gmail route; attachments and sensitive email are excluded. Never invent mailbox contents. Mail checks are handled separately from this model."
+    system += "\nCURRENT GOOGLE TASKS: "+tasks_capability(c)+" Never invent task data or claim actions from memory."
     system += "\nCURRENT CONTACTS: "+contact_capability(c)+" Never invent contact details or use them to message anyone."
     system += "\nCURRENT GOOGLE FILE TOOLS: "+drive_capability(c)+" Never claim file contents or actions from memory."
     system += "\nCURRENT CALENDAR: " + calendar_capability(c) + " Never claim Calendar actions or contents from chat memory. Schedule queries use the separate live route."
@@ -928,6 +1003,8 @@ def reply(c, chat, text, audio=None, note=None):
     if not ans or (last and ans.strip() == last[0].strip()):
         print("repeat/empty answer, regenerating")
         ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=USE_GSEARCH) or "Hmm, ek baar phir bolo na? 🙂"
+    if GOOGLE_TASK_TOPIC.search(ans or ""):
+        ans=tasks_capability(c)
     if CONTACT_TOPIC.search(ans or ""):
         ans=contact_capability(c)
     if DRIVE_TOPIC.search(ans or ""):
@@ -978,6 +1055,10 @@ def handle(c, msg):
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
+    if text.split()[0].split('@')[0].lower() in ('/tasklists','/taskuse','/tasks','/taskadd','/taskconfirm'):
+        ans=tasks_command(c,text,chat)
+        for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
+        return
     if text.split()[0].split('@')[0].lower() in ('/contacts','/contact'):
         ans=contact_command(c,text,chat)
         for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
@@ -1056,6 +1137,7 @@ def main():
     c.kv_set('gmail_reply_rule', 'draft_only_never_send')
     c.add_fact("Sunny approved the Google suite with Calendar first. Calendar is live-source only: show his schedule, create private events only after reviewing destination/date/time; no guest invites, edits or deletes in this release. Gmail stays draft-only, never send. Other suite capabilities are not available until separately implemented.")
     c.add_fact("Google Drive search/read and new plain-text Docs/Sheets creation are available after suite consent. Choose an account with /driveuse, review exact file text/data, then /fileconfirm. Never share/delete files or edit existing files in this release. Gmail remains draft-only, never send.")
+    c.add_fact("Google Contacts is read-only lookup with /contacts and /contact. Google Tasks reads selected lists and creates reviewed new tasks with /taskconfirm; no completion, edits, deletes or assignments. Due dates are date-only, not alarms. Gmail remains draft-only, never send.")
     srv.store = c
     threading.Thread(target=scheduler, args=(c,), daemon=True).start()
     offset = None
