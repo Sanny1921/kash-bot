@@ -6,13 +6,16 @@ SHEET='application/vnd.google-apps.spreadsheet'
 FIELDS='id,name,mimeType,webViewLink,trashed,isAppAuthorized,version,modifiedTime,owners(me),permissions(type,role),capabilities(canEdit,canTrash)'
 
 def load(c,k):return json.loads(c.kv_get(k) or '{}')
-def meta(c,a,f):return drive.call(drive.token(c,a),'https://www.googleapis.com/drive/v3/files/'+urllib.parse.quote(f,safe='')+'?'+urllib.parse.urlencode({'fields':FIELDS}))
+def meta(c,a,f):
+    m=drive.call(drive.token(c,a),'https://www.googleapis.com/drive/v3/files/'+urllib.parse.quote(f,safe='')+'?'+urllib.parse.urlencode({'fields':FIELDS}))
+    m['_wide_drive']='https://www.googleapis.com/auth/drive' in drive.accounts(c).get(a,{}).get('scope','').split()
+    return m
 def fingerprint(m):return hashlib.sha256(json.dumps({k:m.get(k) for k in ('id','name','mimeType','trashed','version','modifiedTime','owners','permissions','isAppAuthorized','capabilities')},sort_keys=True).encode()).hexdigest()
 def editable(m,trash=False):
     if m.get('trashed'):raise ValueError('This file is already in Trash.')
     if not any(o.get('me') for o in m.get('owners',[])):raise ValueError('Only files owned by this account can be changed in this release.')
     if not drive.private(m):raise ValueError('This file is shared, or its sharing state cannot be verified. I will not change a shared file in this release.')
-    if not m.get('isAppAuthorized'):raise ValueError('The current Google grant allows changes only to files created or explicitly opened with KASH. This existing file is read-only to KASH; I did not request broader access.')
+    if not m.get('isAppAuthorized') and not m.get('_wide_drive'):raise ValueError('The current Google grant allows changes only to files created or explicitly opened with KASH. This existing file is read-only to KASH. Say enable older file access to prepare the wider Google approval.')
     if not m.get('capabilities',{}).get('canTrash' if trash else 'canEdit'):raise ValueError('Google does not allow this operation on the selected file.')
 
 def link_id(text):
