@@ -6,15 +6,16 @@ import gmail_link as oauth
 TZ=ZoneInfo('Asia/Kolkata')
 PREFIX='https://www.googleapis.com/auth/'
 SCOPES=' '.join(PREFIX+s for s in ('gmail.readonly','gmail.compose','calendar.calendarlist.readonly','calendar.events.readonly','calendar.events.owned','drive.readonly','drive.file','contacts.readonly','tasks'))
+WIDE_SCOPES=SCOPES+' '+PREFIX+'drive'
 BASE=oauth.BASE
 
 def accounts(c):return json.loads(c.kv_get('calendar_accounts') or '{}')
-def connect_link(c,email):
+def connect_link(c,email,wide=False):
     email=email.strip().lower()
     if not oauth.valid_email(email):raise ValueError('invalid email')
     if not oauth.configured():return None
     key=secrets.token_urlsafe(32)
-    c.kv_set('calendar_launch_'+hashlib.sha256(key.encode()).hexdigest(),json.dumps({'email':email,'until':time.time()+1800}))
+    c.kv_set('calendar_launch_'+hashlib.sha256(key.encode()).hexdigest(),json.dumps({'email':email,'until':time.time()+1800,'wide':bool(wide)}))
     return BASE+'/calendar/connect?'+urllib.parse.urlencode({'key':key})
 @oauth.synchronized
 def authorization(c,key):
@@ -22,9 +23,9 @@ def authorization(c,key):
     launch=json.loads(c.kv_get(k) or '{}')
     if launch.get('until',0)<time.time():raise ValueError('expired link')
     c.kv_set(k,'{}');state=secrets.token_urlsafe(32);verifier=secrets.token_urlsafe(48)
-    c.kv_set('calendar_state_'+hashlib.sha256(state.encode()).hexdigest(),json.dumps({'email':launch['email'],'verifier':verifier,'until':time.time()+900}))
+    c.kv_set('calendar_state_'+hashlib.sha256(state.encode()).hexdigest(),json.dumps({'email':launch['email'],'verifier':verifier,'until':time.time()+900,'scopes':WIDE_SCOPES if launch.get('wide') else SCOPES}))
     challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
-    return 'https://accounts.google.com/o/oauth2/v2/auth?'+urllib.parse.urlencode({'client_id':os.environ['GMAIL_CLIENT_ID'],'redirect_uri':BASE+'/gmail/callback','scope':SCOPES,'response_type':'code','access_type':'offline','prompt':'select_account consent','login_hint':launch['email'],'state':state,'code_challenge':challenge,'code_challenge_method':'S256'})
+    return 'https://accounts.google.com/o/oauth2/v2/auth?'+urllib.parse.urlencode({'client_id':os.environ['GMAIL_CLIENT_ID'],'redirect_uri':BASE+'/gmail/callback','scope':WIDE_SCOPES if launch.get('wide') else SCOPES,'response_type':'code','access_type':'offline','prompt':'select_account consent','login_hint':launch['email'],'state':state,'code_challenge':challenge,'code_challenge_method':'S256'})
 @oauth.synchronized
 def callback(c,args):
     k='calendar_state_'+hashlib.sha256(args.get('state',[''])[0].encode()).hexdigest();st=json.loads(c.kv_get(k) or '{}')
@@ -32,7 +33,7 @@ def callback(c,args):
     c.kv_set(k,'{}')
     if args.get('error'):raise ValueError('consent denied')
     tok=oauth.request_json('https://oauth2.googleapis.com/token',{'client_id':os.environ['GMAIL_CLIENT_ID'],'client_secret':os.environ['GMAIL_CLIENT_SECRET'],'code':args.get('code',[''])[0],'code_verifier':st['verifier'],'grant_type':'authorization_code','redirect_uri':BASE+'/gmail/callback'})
-    if not all(s in tok.get('scope','').split() for s in SCOPES.split()):raise ValueError('required Calendar permissions missing')
+    if not all(s in tok.get('scope','').split() for s in st.get('scopes',SCOPES).split()):raise ValueError('required Calendar permissions missing')
     calendars=api(tok['access_token'],'users/me/calendarList',{'maxResults':250})
     primary=next((d for d in calendars.get('items',[]) if d.get('primary')),None)
     if not primary or primary.get('id','').lower()!=st['email']:raise ValueError('wrong Google account')
@@ -133,6 +134,6 @@ def handle_http(handler,c):
         args=urllib.parse.parse_qs(route.query)
         if route.path=='/calendar/connect':
             url=authorization(c,args.get('key',[''])[0]);handler.send_response(302);handler.send_header('Location',url);handler.end_headers();return True
-        email=callback(c,args);text=email+' Calendar connected. Gmail access unchanged. In Telegram, ask what your day looks like, or use /calendaraccounts to see calendars. Events are only created after you review the destination and time, never edited/deleted or sent as invitations.'
+        email=callback(c,args);text=email+' Google suite connected. Any newly granted Drive scope is now saved for this account. Account names and other connections were preserved. Return to KASH: reviewed file changes still require your yes; no sharing or permanent deletion. Gmail remains draft-only, never send.'
     except Exception:text='Calendar was not connected. Existing connections are unchanged. Return to KASH and use /calendar youraddress@gmail.com for a fresh link; choose that exact Google account.'
     handler.send_response(200);handler.send_header('Content-Type','text/plain; charset=utf-8');handler.end_headers();handler.wfile.write(text.encode());return True
