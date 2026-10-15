@@ -1,6 +1,6 @@
 """Owner chat routing only. Prepares existing reviewed operations, never bypasses confirmation."""
 import json,re,time,secrets
-DOC=re.compile(r'^(?:please\s+)?(?:(?:go (?:on|to) )?google docs? and )?(?:create|make|start)\s+(?:a |an |new )*(?:(google)\s+)?(doc(?:ument)?|sheet|spreadsheet|file)\s+(?:called|named|titled)\s+(.+)$',re.I|re.S)
+DOC=re.compile(r'^(?:please\s+)?(?:(?:go (?:on|to) )?google docs? and )?(?:create|make|start)\s+(?:a |an |new )*(?:(google)\s+)?(doc(?:ument)?s?(?: file)?|sheets?(?: file)?|spreadsheet(?: file)?|file)\s+(?:called|named|titled)\s+(.+)$',re.I|re.S)
 TASK=re.compile(r'^(?:please\s+)?(?:add|create|make)\s+(?:a |new )*(?:google )?task\s+(?:(?:called|named|to)\s+)?(.+)$',re.I|re.S)
 SELECT=re.compile(r'^(?:use|choose|select)\s+(?:(?:account|calendar|list|file|contact)\s+)?(\d+|[^\s]+@[^\s]+)(?:\s+(?:please|and continue))?[.!]?$',re.I)
 CONFIRM=re.compile(r'^(?:confirm|create it|save it|go ahead)\s+([a-f0-9]{8})[.!]?$',re.I)
@@ -74,7 +74,7 @@ def route(c,text,chat,b):
         label,email=alias.group(1).lower(),alias.group(2).lower().rstrip('.!')
         if email not in b.drive_link.accounts(c):return 'Connect '+email+' first with /google '+email+', then name it again. No other account selected.'
         values=aliases(c);values[label]=email;c.kv_set('google_account_aliases',json.dumps(values))
-        return label.capitalize()+' now means '+email+'. New requests default to personal when you do not name an account; college requests never fall back to personal. Every write still has a preview.'
+        return label.capitalize()+' now means '+email+'. I will show that email before creating anything.'
     if not getattr(c,'_natural_scoped',False):
         names=named_account(stripped);values=aliases(c)
         if len(names)>1:return 'Please choose personal or college, not both, for this request.'
@@ -115,7 +115,7 @@ def route(c,text,chat,b):
         if kind.lower()=='file':return 'Should this be a Google Doc or a Google Sheet? Please name the type and title.'
         # Text after a newline or "containing:" is literal content, never generated.
         chunks=re.split(r'\s+(?:containing|with (?:the )?(?:text|content))\s*:\s*|\n',value,maxsplit=1,flags=re.I)
-        title=chunks[0].strip().strip('"');title=re.sub(r'\s+(?:in|on|using|with) (?:my )?(?:personal|college)(?: (?:account|gmail))?$', '',title,flags=re.I);content=chunks[1] if len(chunks)>1 else ''
+        title=chunks[0].strip().strip('"');title=re.sub(r'\s+(?:in|on|using|with) (?:my )?(?:personal|college)(?: gmail)?(?: account)?$', '',title,flags=re.I);content=chunks[1] if len(chunks)>1 else ''
         account=None
         acc=re.search(r'\s+(?:in|using|on)\s+([\w.+-]+@[\w.-]+)\s*$',title,re.I)
         if acc:account=acc.group(1).lower();title=title[:acc.start()].strip()
@@ -123,7 +123,7 @@ def route(c,text,chat,b):
         if re.search(r'\b(?:share|invite|folder|send|overwrite|replace|edit|delete)\b',title,re.I):return 'This release creates new private files in My Drive only. Please give just the title and exact content; no shares or existing-file edits.'
         email,error=destination(c,chat,b,'account',stripped,account)
         if error:return error
-        kind='sheet' if kind.lower() in ('sheet','spreadsheet') else 'doc'
+        kind='sheet' if kind.lower().split()[0] in ('sheet','sheets','spreadsheet') else 'doc'
         rows=[line.split('\t') for line in content.splitlines()] if kind=='sheet' else content
         if kind=='sheet' and (len(rows)>100 or any(len(r)>26 for r in rows)):return 'Use up to 100 rows and 26 columns, columns separated by tabs.'
         code=secrets.token_hex(4)
@@ -134,7 +134,7 @@ def route(c,text,chat,b):
         if not b.drive_link.accounts(c):return b.tasks_capability(c)
         c.kv_set('natural_google_choice_'+str(chat),'{}')
         title=task.group(1).strip()
-        title=re.sub(r'\s+(?:in|on|using|with) (?:my )?(?:personal|college)(?: (?:account|gmail))?$', '',title,flags=re.I)
+        title=re.sub(r'\s+(?:in|on|using|with) (?:my )?(?:personal|college)(?: gmail)?(?: account)?$', '',title,flags=re.I)
         if re.search(r'\b(?:tomorrow|today|tonight|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday|at \d)\b',title,re.I):return 'For a due date, use an exact date: "add a Google task buy milk due 2026-10-20". Tasks dates have no timed alarm.'
         m=re.search(r'\s+due\s+(\d{4}-\d{2}-\d{2})$',title,re.I)
         arg=title if not m else title[:m.start()]+'\nDue: '+m.group(1)
@@ -151,4 +151,9 @@ def route(c,text,chat,b):
     if m:return b.drive_command(c,'/openfile '+m.group(1),chat)
     m=re.fullmatch(r'(?:show|open) contact (\d+)',stripped,re.I)
     if m:return b.contact_command(c,'/contact '+m.group(1),chat)
+    if re.search(r'\b(?:create|make|start)\b.*\b(?:docs?|documents?|sheets?|spreadsheets?|file)\b',stripped,re.I):
+        return 'What title should the new Google Doc or Sheet have? You can say "create a docs file named sunny". Add exact text after "containing:" if you want content; otherwise I will prepare a blank file for review.'
+    if re.fullmatch(r'(?:my )?college account[?!.]*',stripped,re.I):
+        email=aliases(c).get('college')
+        return ('College means '+email+'.' if email else 'College is only an account name you can set when you connect that email. You do not need a college account to create a Doc in your personal account.')
     return None
