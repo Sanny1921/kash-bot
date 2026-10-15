@@ -69,6 +69,13 @@ def destination(c,chat,b,domain,request,account=None):
 def route(c,text,chat,b):
     if not text or text.startswith('/'):return None
     stripped=text.strip()
+    if re.fullmatch(r'(?:enable|allow|connect|upgrade)(?: (?:my|the))? (?:older|existing|all|wider)(?: google)? (?:file|files|drive)(?: access| approval)?(?: (?:for|on) (?:my )?(personal|college)(?: account)?)?[.!]?',stripped,re.I):
+        accounts=b.drive_link.accounts(c);names=named_account(stripped);values=aliases(c)
+        label=next(iter(names)) if len(names)==1 else 'personal' if values.get('personal') else None
+        email=values.get(label) if label else next(iter(accounts)) if len(accounts)==1 else None
+        if not email or email not in accounts:return 'Which connected Google account should get older-file access? Name personal or college after setting its email.'
+        if 'https://www.googleapis.com/auth/drive' in accounts[email].get('scope','').split():return 'Wider Drive permission is already saved for '+email+'. Private owned files can be reviewed for changes; no sharing or permanent deletion.'
+        return b.calendar_command(c,'/google '+email+' files',chat)
     alias=re.fullmatch(r'use (personal|college) account ([\w.+-]+@[\w.-]+)[.!]?',stripped,re.I)
     if alias:
         label,email=alias.group(1).lower(),alias.group(2).lower().rstrip('.!')
