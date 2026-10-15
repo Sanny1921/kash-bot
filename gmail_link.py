@@ -45,6 +45,11 @@ def accounts(c):
         saved.setdefault(email, legacy)
         c.kv_set('gmail_accounts', json.dumps(saved))
         c.kv_set('gmail_refresh', ''); c.kv_set('gmail_connected', '')
+    # Suite consent can serve Gmail without overwriting older encrypted Gmail tokens.
+    sources=json.loads(c.kv_get('gmail_sources') or '{}')
+    for email,entry in json.loads(c.kv_get('workspace_accounts') or '{}').items():
+        if sources.get(email)=='disabled':saved.pop(email,None)
+        elif sources.get(email)!='separate' and SCOPE in entry.get('scope','').split():saved[email]=entry['refresh']
     return saved
 
 def valid_email(email):
@@ -90,12 +95,14 @@ def callback(c, args):
     if not tok.get('refresh_token'): raise ValueError('offline access not granted')
     if SCOPE not in tok.get('scope',SCOPE).split(): raise ValueError('read permission not granted')
     with ACCOUNT_LOCK:
-        saved = accounts(c)
+        accounts(c)
+        saved = json.loads(c.kv_get('gmail_accounts') or '{}')
         saved[email] = cipher().encrypt(tok['refresh_token'].encode()).decode()
         c.kv_set('gmail_accounts',json.dumps(saved))
         grants = json.loads(c.kv_get('gmail_scopes') or '{}')
         grants[email] = tok.get('scope', SCOPE)
         c.kv_set('gmail_scopes',json.dumps(grants))
+        sources=json.loads(c.kv_get('gmail_sources') or '{}');sources[email]='separate';c.kv_set('gmail_sources',json.dumps(sources))
     return email
 
 @synchronized
@@ -104,12 +111,16 @@ def disconnect(c, email=None):
     if email:
         email = email.strip().lower()
         if email not in saved: return False
-        saved.pop(email)
+        raw=json.loads(c.kv_get('gmail_accounts') or '{}');raw.pop(email,None)
+        sources=json.loads(c.kv_get('gmail_sources') or '{}');sources[email]='disabled';c.kv_set('gmail_sources',json.dumps(sources))
         grants=json.loads(c.kv_get('gmail_scopes') or '{}');grants.pop(email,None);c.kv_set('gmail_scopes',json.dumps(grants))
-        c.kv_set('gmail_accounts',json.dumps(saved))
+        c.kv_set('gmail_accounts',json.dumps(raw))
         return True
     c.kv_set('gmail_accounts','{}')
     c.kv_set('gmail_scopes','{}')
+    sources=json.loads(c.kv_get('gmail_sources') or '{}')
+    for email in json.loads(c.kv_get('workspace_accounts') or '{}'):sources[email]='disabled'
+    c.kv_set('gmail_sources',json.dumps(sources))
     # Revoking one grant can invalidate other grants for the same project.
     # Revoke remotely only for an explicit disconnect-all command.
     for encrypted in saved.values():
@@ -269,6 +280,10 @@ def content(c, question):
 
 
 def draft_access(c, email):
+    source=json.loads(c.kv_get('gmail_sources') or '{}').get(email)
+    if source=='disabled':return False
+    suite=json.loads(c.kv_get('workspace_accounts') or '{}').get(email,{})
+    if source!='separate' and SCOPE in suite.get('scope','').split():return COMPOSE_SCOPE in suite['scope'].split()
     return COMPOSE_SCOPE in json.loads(c.kv_get('gmail_scopes') or '{}').get(email,'').split()
 
 def post_draft(token, thread, raw):
