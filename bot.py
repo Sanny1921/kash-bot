@@ -108,9 +108,9 @@ class Health(BaseHTTPRequestHandler):
         if urllib.parse.urlsplit(self.path).path == "/privacy":
             text = ("KASH is Sunny Tiwari's private personal assistant. Gmail access is read-only. "
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
-                    "does not fetch bodies or attachments, does not send mail or mark it as read, and does not send mail to an AI model. "
-                    "An encrypted refresh token is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
-                    "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect to remove KASH's stored token "
+                    "does not fetch bodies or attachments, does not send mail or mark it as read, and does not send mail to an AI model. Each connected account has its own Google consent; the brief labels mail by account. "
+                    "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
+                    "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
             self.wfile.write(text.encode()); return
@@ -625,16 +625,32 @@ def handle(c, msg):
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
-    if text.split()[0].split("@")[0] in ("/gmail", "/gmailtest", "/gmaildisconnect"):
-        command = text.split()[0].split("@")[0]
-        if command == "/gmaildisconnect":
-            gmail_link.disconnect(c)
-            ans = "Gmail disconnected. I won't read it for your brief."
+    if text.strip() and text.split()[0].split("@")[0] in ("/gmail", "/gmailtest", "/gmailaccounts", "/gmaildisconnect"):
+        parts = text.split()
+        command = parts[0].split("@")[0]
+        saved = gmail_link.accounts(c)
+        if command == "/gmailaccounts":
+            ans = "Connected Gmail accounts:\n" + ("\n".join(sorted(saved)) or "None yet. Use /gmail youraddress@gmail.com for each account.")
+        elif command == "/gmaildisconnect":
+            target = parts[1].lower() if len(parts)>1 else ""
+            if target == "all":
+                gmail_link.disconnect(c)
+                ans = "All Gmail accounts disconnected from KASH. Google revocation was attempted; you can also remove KASH in your Google Account's third-party connections."
+            elif target in saved:
+                gmail_link.disconnect(c, target)
+                ans = target + " removed from KASH's saved connections. Other accounts are unchanged. To revoke Google's grant too, remove KASH in that Google Account's third-party connections."
+            else:
+                ans = "Choose an account from /gmailaccounts, then use /gmaildisconnect email. To remove every account use /gmaildisconnect all."
         elif command == "/gmailtest":
             ans = gmail_link.brief(c)
+        elif len(parts)<2:
+            ans = "To add or reconnect a Gmail account, send /gmail youraddress@gmail.com. Repeat for each account with its own Google consent. Use /gmailaccounts to see connections."
+        elif not gmail_link.valid_email(parts[1]):
+            ans = "Send the full address, for example /gmail youraddress@gmail.com."
         else:
-            link = gmail_link.connect_link(c)
-            ans = ("Connect " + gmail_link.EMAIL + " for your 8am mail section. Read-only: sender + subject, no bodies or attachments, no sends or marking mail as read. Bank, DigiLocker and security mail are excluded. This private link expires in 30 minutes.\n" + link) if link else "Gmail setup is not ready yet."
+            email = parts[1].lower()
+            link = gmail_link.connect_link(c, email)
+            ans = ("Add " + email + " to your 8am mail section. Existing accounts stay connected. Choose this exact account on Google. Read-only: sender + subject, no bodies or attachments, no sends or marking mail as read. Bank, DigiLocker and security mail are excluded. Private link expires in 30 minutes.\n" + link) if link else "Gmail setup is not ready yet."
         tg("sendMessage", chat_id=chat, text=ans[:4000], disable_web_page_preview=True); return
     if text.startswith("/memories"):
         m = clean_facts(c)
