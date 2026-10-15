@@ -134,9 +134,9 @@ def route(c,text,chat,b):
         if not b.drive_link.accounts(c):return b.tasks_capability(c)
         c.kv_set('natural_google_choice_'+str(chat),'{}')
         title=task.group(1).strip()
+        title=re.sub(r'\s+(?:in|on|using|with) (?:my )?(?:personal|college)(?: (?:account|gmail))?$', '',title,flags=re.I)
         if re.search(r'\b(?:tomorrow|today|tonight|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday|at \d)\b',title,re.I):return 'For a due date, use an exact date: "add a Google task buy milk due 2026-10-20". Tasks dates have no timed alarm.'
         m=re.search(r'\s+due\s+(\d{4}-\d{2}-\d{2})$',title,re.I)
-        title=re.sub(r'\s+(?:in|on|using|with) (?:my )?(?:personal|college)(?: (?:account|gmail))?$', '',title,flags=re.I)
         arg=title if not m else title[:m.start()]+'\nDue: '+m.group(1)
         dest,error=destination(c,chat,b,'task list',stripped)
         return error or b.tasks_command(c,'/taskadd '+arg,chat)
