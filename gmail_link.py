@@ -8,6 +8,7 @@ from email.utils import parseaddr
 from cryptography.fernet import Fernet
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+COMPOSE_SCOPE = 'https://www.googleapis.com/auth/gmail.compose'
 BASE = os.environ.get('KASH_PUBLIC_URL', 'https://kash-bot.onrender.com').rstrip('/')
 EMAIL = os.environ.get('GMAIL_ACCOUNT', 'sunnykrtiwari192114@gmail.com').lower()
 SENSITIVE = re.compile(r'\bbank\b|banking|digilocker|\botp\b|one[ -]?time|password|passcode|verification|verify|security|authentication|authenticator|\bpin\b|credit.?card|debit.?card|account.?statement|\bupi\b|\bkyc\b|\baadhaar\b|\bpan\b|transaction|payment|wallet|\bpaytm\b|\bphonepe\b|\bgpay\b|\bpaypal\b|\bhdfc\b|\bicici\b|\bsbi\b|\bkotak\b|\baxis\b', re.I)
@@ -49,13 +50,13 @@ def accounts(c):
 def valid_email(email):
     return bool(re.fullmatch(r'[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+', email))
 
-def connect_link(c, email=EMAIL):
+def connect_link(c, email=EMAIL, drafts=False):
     email = email.strip().lower()
     if not valid_email(email): raise ValueError('invalid email')
     if not configured(): return None
     key = secrets.token_urlsafe(32)
     digest = hashlib.sha256(key.encode()).hexdigest()
-    c.kv_set('gmail_launch_' + digest, json.dumps({'email':email,'until':time.time()+1800}))
+    c.kv_set('gmail_launch_' + digest, json.dumps({'email':email,'drafts':bool(drafts),'until':time.time()+1800}))
     return BASE + '/gmail/connect?' + urllib.parse.urlencode({'key':key})
 
 def authorization(c, key):
@@ -66,10 +67,10 @@ def authorization(c, key):
     state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(48)
     statekey = 'gmail_state_' + hashlib.sha256(state.encode()).hexdigest()
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
-    c.kv_set(statekey, json.dumps({'email':launch['email'],'verifier':verifier,'until':time.time()+900}))
+    c.kv_set(statekey, json.dumps({'email':launch['email'],'drafts':launch.get('drafts',False),'verifier':verifier,'until':time.time()+900}))
     return 'https://accounts.google.com/o/oauth2/v2/auth?' + urllib.parse.urlencode({
         'client_id':os.environ['GMAIL_CLIENT_ID'],'redirect_uri':BASE+'/gmail/callback',
-        'response_type':'code','scope':SCOPE,'access_type':'offline','prompt':'select_account consent',
+        'response_type':'code','scope':SCOPE + (' '+COMPOSE_SCOPE if launch.get('drafts') else ''),'access_type':'offline','prompt':'select_account consent',
         'login_hint':launch['email'],'state':state,'code_challenge':challenge,'code_challenge_method':'S256'})
 
 def callback(c, args):
@@ -87,10 +88,14 @@ def callback(c, args):
     email = profile.get('emailAddress','').lower()
     if email != st['email']: raise ValueError('wrong Google account')
     if not tok.get('refresh_token'): raise ValueError('offline access not granted')
+    if SCOPE not in tok.get('scope',SCOPE).split(): raise ValueError('read permission not granted')
     with ACCOUNT_LOCK:
         saved = accounts(c)
         saved[email] = cipher().encrypt(tok['refresh_token'].encode()).decode()
         c.kv_set('gmail_accounts',json.dumps(saved))
+        grants = json.loads(c.kv_get('gmail_scopes') or '{}')
+        grants[email] = tok.get('scope', SCOPE)
+        c.kv_set('gmail_scopes',json.dumps(grants))
     return email
 
 @synchronized
@@ -100,9 +105,11 @@ def disconnect(c, email=None):
         email = email.strip().lower()
         if email not in saved: return False
         saved.pop(email)
+        grants=json.loads(c.kv_get('gmail_scopes') or '{}');grants.pop(email,None);c.kv_set('gmail_scopes',json.dumps(grants))
         c.kv_set('gmail_accounts',json.dumps(saved))
         return True
     c.kv_set('gmail_accounts','{}')
+    c.kv_set('gmail_scopes','{}')
     # Revoking one grant can invalidate other grants for the same project.
     # Revoke remotely only for an explicit disconnect-all command.
     for encrypted in saved.values():
@@ -228,12 +235,13 @@ def account_content(email, encrypted, query):
         candidates.sort(reverse=True)
         docs=[]
         for priority,ts,mid,sender,subject in candidates[:3]:
-            m=request_json(api+'/'+mid+'?'+urllib.parse.urlencode({'format':'full','fields':'payload,internalDate'}),token=token)
+            m=request_json(api+'/'+mid+'?'+urllib.parse.urlencode({'format':'full','fields':'id,threadId,payload,internalDate'}),token=token)
             text=body_text(m.get('payload',{}))
             # Defense in depth: never surface text that escaped Gmail's search exclusions.
             if SENSITIVE.search(text):continue
             if not text:continue
-            docs.append({'account':email,'sender':safe_text(sender,200),'subject':safe_text(subject,250),'received_ms':ts,'body':text[:6000]})
+            headers={h['name'].lower():h['value'] for h in m.get('payload',{}).get('headers',[])}
+            docs.append({'id':mid,'thread_id':m.get('threadId',''),'message_id':headers.get('message-id',''),'reply_to':headers.get('reply-to',sender),'account':email,'sender':safe_text(sender,200),'subject':safe_text(subject,250),'received_ms':ts,'body':text[:6000]})
         return docs,None
     except urllib.error.HTTPError as e:
         if e.code in (401,403): return [],email+': access could not be used; check /gmailaccounts and reconnect only if Google permission expired or was blocked.'
@@ -258,3 +266,50 @@ def content(c, question):
         if error:notices.append(error)
     docs.sort(key=lambda d:d['received_ms'],reverse=True)
     return docs[:8],notices
+
+
+def draft_access(c, email):
+    return COMPOSE_SCOPE in json.loads(c.kv_get('gmail_scopes') or '{}').get(email,'').split()
+
+def post_draft(token, thread, raw):
+    # Only draft creation exists. Never add messages.send, drafts.send, modify or delete.
+    payload={'message':{'raw':raw,'threadId':thread}}
+    req=urllib.request.Request('https://gmail.googleapis.com/gmail/v1/users/me/drafts',data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},method='POST')
+    with urllib.request.urlopen(req,timeout=20) as r:return json.load(r)
+
+@synchronized
+def create_reply_draft(c, doc, body):
+    from email.message import EmailMessage
+    email=doc['account'];saved=accounts(c)
+    if email not in saved:return {'status':'not_connected'}
+    if not draft_access(c,email):return {'status':'consent_needed','account':email}
+    key='gmail_draft_'+hashlib.sha256((email+'|'+doc['id']).encode()).hexdigest()
+    previous=json.loads(c.kv_get(key) or '{}')
+    if previous:return {'status':'exists',**previous}
+    # Fetch thread immediately before preparing a draft, so replied mail isn't pending.
+    refresh=cipher().decrypt(saved[email].encode()).decode()
+    tokeninfo=request_json('https://oauth2.googleapis.com/token',{'client_id':os.environ['GMAIL_CLIENT_ID'],'client_secret':os.environ['GMAIL_CLIENT_SECRET'],'refresh_token':refresh,'grant_type':'refresh_token'})
+    if COMPOSE_SCOPE not in tokeninfo.get('scope','').split():return {'status':'consent_needed','account':email}
+    token=tokeninfo['access_token']
+    thread=request_json('https://gmail.googleapis.com/gmail/v1/users/me/threads/'+doc['thread_id']+'?'+urllib.parse.urlencode({'format':'metadata','metadataHeaders':'From','fields':'messages(id,labelIds,payload/headers)'}),token=token)
+    messages=thread.get('messages',[])
+    if not messages or messages[-1].get('id')!=doc['id']:return {'status':'thread_changed'}
+    if 'SENT' in messages[-1].get('labelIds',[]):return {'status':'already_replied'}
+    sender=parseaddr(doc['sender'])[1];target=parseaddr(doc.get('reply_to',''))[1]
+    if not valid_email(target) or sender.lower()!=target.lower():return {'status':'recipient_review_needed'}
+    if re.search(r'no[._-]?reply|do[._-]?not[._-]?reply|mailer-daemon',target,re.I):return {'status':'not_replyable'}
+    if SENSITIVE.search(doc['sender']+' '+doc['subject']+' '+doc['body']+' '+body):return {'status':'sensitive_skipped'}
+    msg=EmailMessage();msg['From']=email;msg['To']=target
+    msg['Subject']=doc['subject'] if doc['subject'].lower().startswith('re:') else 'Re: '+doc['subject']
+    if doc.get('message_id'):
+        msg['In-Reply-To']=doc['message_id'];msg['References']=doc['message_id']
+    msg.set_content(body)
+    c.kv_set(key,json.dumps({'status':'creation_pending','account':email,'subject':doc['subject']}))
+    try:result=post_draft(token,doc['thread_id'],base64.urlsafe_b64encode(msg.as_bytes()).decode())
+    except Exception:
+        # Ambiguous HTTP/network writes must not be auto-retried into duplicates.
+        c.kv_set(key,json.dumps({'status':'creation_unverified','account':email,'subject':doc['subject']}))
+        return {'status':'creation_unverified'}
+    record={'account':email,'subject':doc['subject'],'draft_id':result.get('id',''),'recipient':target}
+    c.kv_set(key,json.dumps(record))
+    return {'status':'created',**record}
