@@ -6,6 +6,7 @@ import calendar_link
 import drive_link
 import contacts_link
 import tasks_link
+import reply_watches
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -114,7 +115,7 @@ class Health(BaseHTTPRequestHandler):
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
                     "reads non-sensitive email bodies on request and sends selected message text to the configured Gemini model for a summary. It skips attachments, sensitive mail, sending and marking mail as read. Eligible reply drafts also use the configured Gemini model. Each connected account has its own Google consent; the brief labels mail by account. Mail-content questions use live content with sensitive-mail filtering. Optional compose consent enables reply drafts in Gmail, never sending; read access remains available without compose consent. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
-                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
+                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. Optional reply watches use only Gmail metadata for an owner-confirmed exact sender/thread, checked hourly for up to 30 days; sender identity is not authenticated and offline delays are possible. /replywatches lists/stops watches. No email bodies or outbound messages are used by watches. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
@@ -288,7 +289,7 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
-    if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text) or GOOGLE_TASK_TOPIC.search(text)):return None
+    if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text) or GOOGLE_TASK_TOPIC.search(text) or REPLY_WATCH_TOPIC.search(text)):return None
     """Returns a system-note string describing the action result, or None."""
     if not ACTION_RE.search(text):
         return None
@@ -352,6 +353,7 @@ def scheduler(c):
                             d["nudged"] = True; c.rem_put(d)
                         elif d["status"] == "fired" and d.get("nudged") and now - d["fired_ts"] > 24 * 3600:
                             d["status"] = "done"; c.rem_put(d)
+                reply_watches.check(c,lambda target,message:tg("sendMessage",chat_id=target,text=message,disable_web_page_preview=True))
                 t = datetime.now(IST)
                 today = t.strftime("%Y-%m-%d")
                 if t.hour >= BRIEF_HOUR and t.hour < 22 and c.kv_get("last_brief") != today:
@@ -549,6 +551,68 @@ def web_context(text):
             parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
     return "\n".join(parts)[:14000]
 
+REPLY_WATCH_TOPIC=re.compile(r'(?:remind|yaad|याद).*(?:when|once|jab|जब).*(?:reply|replies|mails? back|emails? back|respond|जवाब)',re.I)
+
+def replywatch_command(c,text,chat):
+    parts=text.split(maxsplit=1);cmd=parts[0].split('@')[0].lower();arg=parts[1].strip() if len(parts)>1 else ''
+    try:
+        if cmd=='/replywatches':
+            rows=reply_watches.all_watches(c)
+            return '\n'.join(['Reply watches (hourly, up to 30 days):']+[k+' | '+v['status']+' | ['+v['account']+'] '+v['sender']+' | '+v['subject']+' | '+v['reminder'] for k,v in rows.items() if str(v['chat'])==str(chat)])
+        if cmd=='/replywatchcancel':
+            record=reply_watches.all_watches(c).get(arg)
+            if not record or str(record['chat'])!=str(chat):return 'Choose a watch ID from /replywatches.'
+            return 'Reply watch cancelled.' if reply_watches.cancel(c,arg) else 'That watch is no longer active.'
+        if cmd=='/replywatch':
+            fields=[v.strip() for v in arg.split('|')]
+            if len(fields)!=3:return 'Use /replywatch CONTACT_NUMBER or exact@email | your Gmail account | reminder text. First /contacts NAME if using a contact number.'
+            target,email,reminder=fields;email=email.lower();target=target.lower()
+            if email not in gmail_link.accounts(c):return 'Choose an actually connected Gmail account: '+', '.join(sorted(gmail_link.accounts(c)))
+            if target.isdigit():
+                results=json.loads(c.kv_get('contact_results_'+str(chat)) or '{}');n=int(target)-1
+                if results.get('until',0)<time.time() or n<0 or n>=len(results.get('rows',[])):return 'Use /contacts NAME for a fresh contact list first.'
+                r=results['rows'][n];contact=contacts_link.get(c,r['account'],r['resource']);emails=sorted(set(x.lower() for x in contact['emails'] if gmail_link.valid_email(x)))
+                if len(emails)!=1:return 'That saved contact has '+str(len(emails))+' email addresses. Choose the exact address shown in /contact NUMBER, then use it in /replywatch.'
+                target=emails[0]
+            if not gmail_link.valid_email(target):return 'Use an exact email address or a current /contacts result number.'
+            if gmail_link.SENSITIVE.search(target+' '+reminder):return 'I cannot watch sensitive banking, identity, OTP or security-related mail.'
+            if not reminder or len(reminder)>300:return 'Use a reminder text of 1-300 characters.'
+            rows=reply_watches.candidates(c,email,target)
+            if not rows:return 'No eligible non-sensitive sent thread to '+target+' was found in the last 90 days. I cannot infer which reply to watch. Nothing activated.'
+            c.kv_set('replywatch_choices_'+str(chat),json.dumps({'until':time.time()+900,'account':email,'sender':target,'reminder':reminder,'rows':rows}))
+            return '\n'.join(['Choose the EXACT thread for '+target+' in '+email+':']+[str(n)+'. '+r['subject'] for n,r in enumerate(rows,1)]+['Use /watchthread NUMBER. No watch is active yet.'])
+        if cmd=='/watchthread':
+            data=json.loads(c.kv_get('replywatch_choices_'+str(chat)) or '{}');n=int(arg)-1
+            if data.get('until',0)<time.time() or n<0 or n>=len(data.get('rows',[])):return 'Prepare /replywatch again for a fresh thread list.'
+            row=data['rows'][n];state,last=reply_watches.inspect(c,data['account'],data['sender'],row['thread'])
+            if state=='already_replied':return 'That thread already has an incoming message from the chosen address. Check Gmail now; no future watch was activated.'
+            if state!='awaiting':return 'That thread changed or looks sensitive. No watch activated; inspect Gmail before choosing another thread.'
+            code=__import__('secrets').token_hex(4)
+            record={'account':data['account'],'sender':data['sender'],'thread':row['thread'],'subject':row['subject'],'reminder':data['reminder'],'chat':chat}
+            c.kv_set('replywatch_pending_'+str(chat),json.dumps({'until':time.time()+900,'code':code,'record':record}))
+            return ('Review reply watch:\nGmail: '+data['account']+'\nExact sender address: '+data['sender']+'\nThread: '+row['subject']+'\nReminder: '+data['reminder']+'\nI will check this thread hourly, not instantly, for up to 30 days. Offline/free-host delays can make it later. This matches a sender address, not proof of the person. No email bodies, attachments or messages to the contact.\nTo start, /replywatchconfirm '+code+' within 15 minutes. Nothing activated yet.')
+        if cmd=='/replywatchconfirm':
+            data=json.loads(c.kv_get('replywatch_pending_'+str(chat)) or '{}')
+            if data.get('code')!=arg or data.get('until',0)<time.time():return 'That preview expired or is invalid. Prepare a new reply watch.'
+            status,rid=reply_watches.activate(c,data['record'])
+            if status=='active':return 'Reply watch '+rid+' is active. Hourly checks for up to 30 days; it may be delayed while offline. /replywatches lists it; /replywatchcancel '+rid+' stops it. No email sent.'
+            if status=='duplicate':return 'An active watch already covers this sender/thread: '+rid+'. No duplicate created.'
+            if status=='already_replied':return 'A reply already arrived in that thread. No watch activated; check Gmail now.'
+            return 'Watch not activated: '+status+'. Check the thread or existing watches.'
+        return 'Reply-watch commands: /replywatch, /watchthread, /replywatchconfirm, /replywatches, /replywatchcancel.'
+    except Exception:return 'Could not verify that reply watch. Nothing newly activated. Check Gmail/Contacts access and the command.'
+
+def live_replywatch_answer(c,text,chat):
+    if not text or not REPLY_WATCH_TOPIC.search(text):return None
+    # This route must precede generic reminders and mail summaries.
+    prompt='Extract only the explicit contact name and reminder text from this owner request for a reminder when someone replies by email. JSON {name:string,reminder:string}. Do not pick an email account, sender address or thread. Ambiguous references get empty name. No action.'
+    try:data=json.loads(gemini(prompt,[{"role":"user","parts":[{"text":text}]}],json_out=True,search=False))
+    except Exception:data={}
+    if data.get('name'):
+        result=contact_command(c,'/contacts '+data['name'],chat)
+        return result+'\n\nFor the reply reminder, choose the exact contact/address and Gmail account with /replywatch CONTACT_NUMBER | youraccount@gmail.com | '+data.get('reminder','call this contact')[:300]+'. Then choose its thread and confirm hourly checking. Nothing activated yet.'
+    return 'Choose the contact first with /contacts NAME, then /replywatch CONTACT_NUMBER or exact@email | youraccount@gmail.com | reminder text. I will show the exact thread and hourly-check terms before activating.'
+
 GOOGLE_TASK_TOPIC=re.compile(r'google tasks|task lists|my tasks|मेरे टास्क',re.I)
 
 def tasks_capability(c):
@@ -613,7 +677,7 @@ def live_tasks_answer(c,text,chat):
 CONTACT_TOPIC=re.compile(r'find.*contact|look.*contact|contact.*(?:number|email|details)|(?:phone number|email address) (?:for|of)|कॉन्टैक्ट',re.I)
 
 def contact_capability(c):
-    return 'Contacts are read-only. Use /contacts NAME to search and /contact NUMBER for current details. I do not message, edit, delete or bulk export contacts. Contact-triggered reminders are not enabled.' if drive_link.accounts(c) else 'Connect Google suite first: /google youraddress@gmail.com.'
+    return 'Contacts are read-only. Use /contacts NAME to search and /contact NUMBER for current details. I do not message, edit, delete or bulk export contacts. Reply-triggered reminders use an exact account/sender/thread, review and confirmation; /replywatch shows the flow. They check hourly for up to 30 days and may be late offline. No contact messaging.' if drive_link.accounts(c) else 'Connect Google suite first: /google youraddress@gmail.com.'
 
 def contact_command(c,text,chat):
     if not drive_link.accounts(c):return contact_capability(c)
@@ -930,6 +994,11 @@ def reply(c, chat, text, audio=None, note=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    watch_answer=live_replywatch_answer(c,text,chat)
+    if watch_answer is not None:
+        heard="[voice note] "+text if audio else text
+        c.add_turn(chat,heard,"[Reply-watch preparation handled separately; no watch activated without exact preview confirmation.]")
+        return watch_answer,heard
     task_answer=live_tasks_answer(c,text,chat)
     if task_answer is not None:
         heard="[voice note] "+text if audio else text
@@ -1055,6 +1124,10 @@ def handle(c, msg):
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
+    if text.split()[0].split('@')[0].lower() in ('/replywatch','/watchthread','/replywatchconfirm','/replywatches','/replywatchcancel'):
+        ans=replywatch_command(c,text,chat)
+        for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
+        return
     if text.split()[0].split('@')[0].lower() in ('/tasklists','/taskuse','/tasks','/taskadd','/taskconfirm'):
         ans=tasks_command(c,text,chat)
         for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
