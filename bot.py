@@ -108,7 +108,7 @@ class Health(BaseHTTPRequestHandler):
         if urllib.parse.urlsplit(self.path).path == "/privacy":
             text = ("KASH is Sunny Tiwari's private personal assistant. Gmail access is read-only. "
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
-                    "does not fetch bodies or attachments, does not send mail or mark it as read, and does not send mail to an AI model. Each connected account has its own Google consent; the brief labels mail by account. "
+                    "does not fetch bodies or attachments, does not send mail or mark it as read, and does not send mail to an AI model. Each connected account has its own Google consent; the brief labels mail by account. Natural-language mail checks use the same live read-only fetch. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
@@ -531,6 +531,24 @@ def web_context(text):
             parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
     return "\n".join(parts)[:14000]
 
+MAIL_TOPIC = re.compile(r"\b(?:g-?mail|e-?mails?|mails?|inbox)\b", re.I)
+MAIL_CHECK = re.compile(r"check|read|show|summari[sz]e|look|found|find|received|got|new|recent|important|all|kya|dikha|dekho|bata|aayi|aaye|padh|dekh", re.I)
+MAIL_STATUS = re.compile(r"connect|access|account|hook|linked", re.I)
+MAIL_SEND = re.compile(r"\b(?:send|reply|forward|delete|remove)\b", re.I)
+
+def live_mail_answer(c, text):
+    if not text or not MAIL_TOPIC.search(text): return None
+    saved = gmail_link.accounts(c)
+    if MAIL_SEND.search(text):
+        return "Gmail access is read-only. I can check recent sender + subject, but I cannot send, reply, forward or delete mail."
+    if MAIL_STATUS.search(text) and not MAIL_CHECK.search(text):
+        if saved:
+            return "Gmail is connected: " + ", ".join(sorted(saved)) + ". I can check recent sender + subject. Add another with /gmail youraddress@gmail.com."
+        return "No Gmail account is connected yet. Use /gmail youraddress@gmail.com and approve that account's read-only consent."
+    if MAIL_CHECK.search(text) or len(text.split()) <= 4:
+        return gmail_link.brief(c)
+    return None
+
 def reply(c, chat, text, audio=None, note=None):
     # Transcribe voice first so the exact same research gate and lookup used for
     # typed messages can run before KASH answers. Do not answer from model memory
@@ -545,8 +563,14 @@ def reply(c, chat, text, audio=None, note=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    mail_answer = live_mail_answer(c, text)
+    if mail_answer is not None:
+        # Deterministic live fetch; never send mailbox headers to the language model.
+        return mail_answer, ("[voice note] " + text if audio else text)
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
+    connected_count = len(gmail_link.accounts(c))
+    system += "\n\nCURRENT GMAIL STATE FROM THE DATABASE: " + str(connected_count) + " account(s) connected. This overrides older chat claims. If the count is positive, never say Gmail is not connected or demand a connection before checking mail. Gmail checks use a separate live read-only route; do not invent mailbox contents."
     if note:
         system += "\n\n" + note
     if text and WEB_RE.search(text):
@@ -581,6 +605,8 @@ def reply(c, chat, text, audio=None, note=None):
     else:
         contents.append({"role": "user", "parts": [{"text": text}]})
     ans = gemini(system, contents, search=USE_GSEARCH)
+    if connected_count and MAIL_TOPIC.search(ans or "") and re.search(r"not connected|no .*connected|connect.*first|cannot.*(?:read|check).*mail|can't.*(?:read|check).*mail|nahi.*connect|connect.*nahi|authorize.*first", ans or "", re.I):
+        ans = "Gmail is already connected to " + str(connected_count) + " account(s). Ask me to check your mail, or use /gmailtest for the live mail section."
     last = [t for r, t in rows if r == "model"][-1:]
     if not ans or (last and ans.strip() == last[0].strip()):
         print("repeat/empty answer, regenerating")
