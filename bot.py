@@ -8,6 +8,7 @@ import contacts_link
 import tasks_link
 import reply_watches
 import notes_log
+import expense_log
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -116,6 +117,7 @@ class Health(BaseHTTPRequestHandler):
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
                     "reads non-sensitive email bodies on request and sends selected message text to the configured Gemini model for a summary. It skips attachments, sensitive mail, sending and marking mail as read. Eligible reply drafts also use the configured Gemini model. Each connected account has its own Google consent; the brief labels mail by account. Mail-content questions use live content with sensitive-mail filtering. Optional compose consent enables reply drafts in Gmail, never sending; read access remains available without compose consent. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
+                    "The optional expense log stores only owner-confirmed manual entries in MongoDB with exact integer minor units. Currency/date/amount are previewed; weekly sums separate currencies and include confirmed entries only. It does not access banks/cards, pay, import statements, edit or delete entries. Expense text is not sent to the model. "
                     "Private quick-capture notes are stored in MongoDB separately from chat memory, searched literally and returned only to the owner. They are not sent to the language model. Secret-looking text is rejected; media capture, sharing, editing and deletion are not supported. "
                     "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. Optional reply watches use only Gmail metadata for an owner-confirmed exact sender/thread, checked hourly for up to 30 days; sender identity is not authenticated and offline delays are possible. /replywatches lists/stops watches. No email bodies or outbound messages are used by watches. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
@@ -291,6 +293,7 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
+    if text and (EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):return None
     if text and (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip())):return None
     if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text) or GOOGLE_TASK_TOPIC.search(text) or REPLY_WATCH_TOPIC.search(text)):return None
     """Returns a system-note string describing the action result, or None."""
@@ -553,6 +556,83 @@ def web_context(text):
         if texts.get(u):
             parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
     return "\n".join(parts)[:14000]
+
+EXPENSE_ADD_RE=re.compile(r'^(?:i\s+)?spent\s+(?:(INR|Rs[.]?|₹|USD|EUR|GBP|[$€£])\s*)?([0-9][0-9,]*(?:[.][0-9]+)?)(?:\s*(INR|rupees|USD|EUR|GBP))?\s+(?:on|for)\s+(.+)$',re.I|re.S)
+EXPENSE_FIND_RE=re.compile(r'^(?:weekly (?:expense|spending) total|(?:show |what (?:are|is) )?(?:my )?(?:expenses|spending)(?: (?:this week|last week|weekly))?[?]?)$',re.I)
+
+def expense_preview(c,chat,amount,currency,category,description,day,source=None):
+    try:
+        minor=expense_log.amount_minor(amount);currency=currency.upper()
+        if currency not in expense_log.CURRENCIES:return 'Use an explicit supported currency: INR, USD, EUR or GBP. Currencies are never converted or mixed.'
+        when=datetime.strptime(day,'%Y-%m-%d').date()
+        if when>datetime.now(IST).date():return 'That date is in the future. This log records money already spent, not planned spending.'
+        if not category.strip() or len(category)>60 or not description.strip() or len(description)>300:return 'Use a category up to 60 characters and a description up to 300 characters.'
+        if re.search(r'password|\botp\b|\bcvv\b|\bcvc\b|card number|account number|api[ _-]?key|private key|\b(?:\d[ -]?){13,19}\b',category+' '+description,re.I):return 'That description looks like it contains a secret or banking identifier. I did not store it; use a plain label such as cab or lunch.'
+        code=__import__('secrets').token_hex(4)
+        entry={'minor':minor,'currency':currency,'category':category.strip().lower(),'description':description.strip(),'date':when.isoformat()}
+        c.kv_set('expense_pending_'+str(chat),json.dumps({'entry':entry,'code':code,'until':time.time()+900,'source':str(source) if source is not None else code}))
+        return ('Review expense entry (private log only, NOT a payment):\n'+expense_log.money(minor,currency)+'\nDate: '+when.strftime('%a %d %b %Y')+'\nCategory: '+entry['category']+'\nDescription: '+entry['description']+'\nTo record this exact amount/date/currency, /expenseconfirm '+code+' within 15 minutes. Nothing recorded yet.')
+    except ValueError:return 'Use a positive amount with at most 2 decimals and an exact date YYYY-MM-DD. Nothing recorded.'
+
+def expense_command(c,text,chat,source=None):
+    parts=text.split(maxsplit=1);cmd=parts[0].split('@')[0].lower();arg=parts[1].strip() if len(parts)>1 else ''
+    try:
+        if cmd=='/expense':
+            values=[x.strip() for x in arg.split('|')]
+            if len(values)!=4:return 'Use /expense AMOUNT CURRENCY | CATEGORY | DESCRIPTION | YYYY-MM-DD, then confirm the preview. Example: /expense 200 INR | transport | cab | '+datetime.now(IST).strftime('%Y-%m-%d')
+            amount_currency=values[0].split()
+            if len(amount_currency)!=2:return 'Include the currency, e.g. 200 INR. Supported: INR, USD, EUR, GBP.'
+            return expense_preview(c,chat,amount_currency[0],amount_currency[1],values[1],values[2],values[3],source)
+        if cmd=='/expenseconfirm':
+            data=json.loads(c.kv_get('expense_pending_'+str(chat)) or '{}')
+            if data.get('code')!=arg or data.get('until',0)<time.time():return 'That expense preview expired or is invalid. Prepare a new preview.'
+            r,duplicate=expense_log.add(c,chat,data['entry'],data['source'])
+            return ('Already recorded this source message. Entry ' if duplicate else 'Recorded expense entry ')+r['id']+': '+expense_log.money(r['minor'],r['currency'])+' on '+r['date']+' for '+r['description']+'. This is only a private log, no money moved. /expenses week shows this week.'
+        if cmd=='/expenses':
+            today=datetime.now(IST).date();monday=today-timedelta(days=today.weekday())
+            if arg.lower() in ('last week','lastweek'):start=monday-timedelta(days=7);end=monday
+            elif arg.lower() in ('','week','this week','weekly'):start=monday;end=monday+timedelta(days=7)
+            else:
+                fields=arg.split()
+                if len(fields)!=2:return 'Use /expenses week, /expenses last week, or /expenses START_DATE END_DATE. Custom dates are inclusive.'
+                start=datetime.strptime(fields[0],'%Y-%m-%d').date();end=datetime.strptime(fields[1],'%Y-%m-%d').date()+timedelta(days=1)
+                if end<=start or (end-start).days>366:return 'Use an ordered date window of up to 366 days.'
+            rows=expense_log.entries(c,chat,start,end);totals=expense_log.totals(rows)
+            lines=['Recorded expenses '+start.strftime('%a %d %b %Y')+' through '+(end-timedelta(days=1)).strftime('%a %d %b %Y')+' (IST dates):']
+            if not rows:lines.append('No confirmed entries in this period. This is not a bank statement or proof of zero spending.')
+            else:
+                lines.extend('Total '+expense_log.money(v,k) for k,v in sorted(totals.items()))
+                lines.append(str(len(rows))+' confirmed entries; currencies kept separate, no conversion.')
+                for r in rows[:20]:lines.append(r['id']+' | '+r['date']+' | '+expense_log.money(r['minor'],r['currency'])+' | '+r['category']+' | '+r['description'])
+                if len(rows)>20:lines.append('Showing newest 20 entries; totals include all '+str(len(rows))+'.')
+            lines.append('Manual private log only, not connected to banks or cards. No payments, automatic imports, edits or deletion.')
+            return '\n'.join(lines)
+        return 'Expense log: "spent 200 on cab" prepares a preview using INR unless you specify currency. /expense AMOUNT CURRENCY | CATEGORY | DESCRIPTION | YYYY-MM-DD is exact. /expenseconfirm CODE records it; /expenses week totals confirmed entries only.'
+    except Exception:return 'Could not verify that expense operation. Check /expenses week before adding again. No money moved.'
+
+def live_expense_answer(c,text,chat,source=None):
+    if not text:return None
+    match=EXPENSE_ADD_RE.match(text.strip())
+    if match:
+        before,amount,after,description=match.groups()
+        if before and after and before.upper()!=after.upper():return 'Please use one explicit currency: INR, USD, EUR or GBP.'
+        raw=(before or after or 'INR').upper();currency={'₹':'INR','RS':'INR','RS.':'INR','RUPEES':'INR','€':'EUR','£':'GBP'}.get(raw,raw)
+        if currency=='$':return 'Which currency do you mean by $? Use an explicit code such as USD in the expense request.'
+        now=datetime.now(IST);day=now.date()
+        relative=re.search(r'\s+(today|yesterday)$',description,re.I)
+        explicit=re.search(r'\s+on (\d{4}-\d{2}-\d{2})$',description,re.I)
+        if relative:
+            if now.hour<4:return 'Which date do you mean by '+relative.group(1)+'? It is after midnight. Use an exact YYYY-MM-DD date with /expense.'
+            day-=timedelta(days=1 if relative.group(1).lower()=='yesterday' else 0);description=description[:relative.start()].strip()
+        elif explicit:
+            try:day=datetime.strptime(explicit.group(1),'%Y-%m-%d').date()
+            except ValueError:return 'That expense date is invalid. Use YYYY-MM-DD.'
+            description=description[:explicit.start()].strip()
+        elif re.search(r'last|ago|tomorrow|\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b(?:kal|aaj)\b',description,re.I):return 'Please give the exact spending date with /expense AMOUNT CURRENCY | CATEGORY | DESCRIPTION | YYYY-MM-DD.'
+        category='transport' if re.search(r'cab|taxi|uber|bus|train|auto|metro|fuel',description,re.I) else 'food' if re.search(r'lunch|dinner|breakfast|coffee|food|snack',description,re.I) else 'other'
+        return expense_preview(c,chat,amount,currency,category,description,day.isoformat(),source)
+    if EXPENSE_FIND_RE.match(text.strip()):return expense_command(c,'/expenses '+('last week' if 'last week' in text.lower() else 'week'),chat,source)
+    return None
 
 NOTE_SAVE_RE=re.compile(r'^(?:save this|save note|save|remember this note|note this|सेव करो|यह सेव करो)\b[ :\n-]*(.*)$',re.I|re.S)
 NOTE_FIND_RE=re.compile(r'^(?:what did i save about|what have i saved about|find my notes about|search my notes for|notes about)\s*(.*?)\s*[?]?$' ,re.I|re.S)
@@ -1029,6 +1109,10 @@ def reply(c, chat, text, audio=None, note=None, source_id=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    expense_answer=live_expense_answer(c,text,chat,source_id)
+    if expense_answer is not None:
+        c.add_turn(chat,"[Private expense log request]","[Expense preview/summary handled separately; no expense content stored in chat history.]")
+        return expense_answer,text
     notes_answer=live_notes_answer(c,text,chat,source_id)
     if notes_answer is not None:
         c.add_turn(chat,"[Private note save/search request]","[Notes handled separately; content not stored in chat history.]")
@@ -1157,12 +1241,16 @@ def handle(c, msg):
                 tg("sendMessage", chat_id=chat, text=gemini(SYSTEM, [{"role": "user", "parts": [{"text": res + " Sunny said (voice): " + said + "\nConfirm in one short warm line."}]}]))
         except Exception as e:
             print("voice action failed:", e)
-        if not (NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip())):extract(c, said)
+        if not (NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip()) or EXPENSE_ADD_RE.match((said or '').strip()) or EXPENSE_FIND_RE.match((said or '').strip())):extract(c, said)
         return
     if not text:
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
+    if text.split()[0].split('@')[0].lower() in ('/expense','/expenses','/expenseconfirm'):
+        ans=expense_command(c,text,chat,msg.get('message_id'))
+        for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
+        return
     if text.split()[0].split('@')[0].lower() in ('/save','/notes','/note'):
         ans=notes_command(c,text,chat,msg.get('message_id'))
         for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
@@ -1244,7 +1332,7 @@ def handle(c, msg):
         ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
     for offset in range(0,len(ans),3900):
         tg("sendMessage", chat_id=chat, text=ans[offset:offset+3900], disable_web_page_preview=True)
-    if not (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip())):extract(c, text)
+    if not (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip()) or EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):extract(c, text)
 
 def main():
     srv = serve_health()
