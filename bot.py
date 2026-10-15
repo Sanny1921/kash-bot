@@ -4,6 +4,7 @@ Also serves /health on $PORT so a free host + external pinger can keep it awake.
 import gmail_link
 import calendar_link
 import drive_link
+import contacts_link
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -112,7 +113,7 @@ class Health(BaseHTTPRequestHandler):
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
                     "reads non-sensitive email bodies on request and sends selected message text to the configured Gemini model for a summary. It skips attachments, sensitive mail, sending and marking mail as read. Eligible reply drafts also use the configured Gemini model. Each connected account has its own Google consent; the brief labels mail by account. Mail-content questions use live content with sensitive-mail filtering. Optional compose consent enables reply drafts in Gmail, never sending; read access remains available without compose consent. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
-                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts and Tasks are not active until implemented. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
+                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Tasks are not active until implemented. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
@@ -286,7 +287,7 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
-    if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text)):return None
+    if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text)):return None
     """Returns a system-note string describing the action result, or None."""
     if not ACTION_RE.search(text):
         return None
@@ -546,6 +547,43 @@ def web_context(text):
         if texts.get(u):
             parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
     return "\n".join(parts)[:14000]
+
+CONTACT_TOPIC=re.compile(r'find.*contact|look.*contact|contact.*(?:number|email|details)|(?:phone number|email address) (?:for|of)|कॉन्टैक्ट',re.I)
+
+def contact_capability(c):
+    return 'Contacts are read-only. Use /contacts NAME to search and /contact NUMBER for current details. I do not message, edit, delete or bulk export contacts. Contact-triggered reminders are not enabled.' if drive_link.accounts(c) else 'Connect Google suite first: /google youraddress@gmail.com.'
+
+def contact_command(c,text,chat):
+    if not drive_link.accounts(c):return contact_capability(c)
+    parts=text.split(maxsplit=1);cmd=parts[0].split('@')[0].lower();arg=parts[1].strip() if len(parts)>1 else ''
+    try:
+        if cmd=='/contacts':
+            if len(arg)<2:return 'Search Contacts with at least two letters: /contacts NAME.'
+            rows,notices=contacts_link.search(c,arg)
+            c.kv_set('contact_results_'+str(chat),json.dumps({'until':time.time()+900,'rows':rows}))
+            lines=['Contacts matching '+arg+':']
+            for n,r in enumerate(rows,1):
+                label=gmail_link.safe_text(', '.join(r['names']) or '(unnamed)',140)
+                lines.append(str(n)+'. '+label+' ['+r['account']+']\n'+', '.join(gmail_link.safe_text(v,150) for v in r['emails']+r['phones']))
+            if not rows:lines.append('No matching contacts returned. Try another spelling or prefix.')
+            return '\n'.join(lines+notices+['These are saved contact details, not verified identities. /contact NUMBER rechecks one. Nothing sent.'])
+        if cmd=='/contact':
+            data=json.loads(c.kv_get('contact_results_'+str(chat)) or '{}')
+            if data.get('until',0)<time.time():return 'Run /contacts NAME first for a current numbered list.'
+            i=int(arg)-1
+            if i<0 or i>=len(data.get('rows',[])):return 'Choose a number from the latest /contacts result.'
+            r=data['rows'][i];live=contacts_link.get(c,r['account'],r['resource'])
+            return ('['+live['account']+'] '+gmail_link.safe_text(', '.join(live['names']) or '(unnamed)',160)+'\nEmail: '+', '.join(gmail_link.safe_text(v,180) for v in live['emails'])+'\nPhone: '+', '.join(gmail_link.safe_text(v,100) for v in live['phones'])+'\nSaved contact data only, not identity verification. Nothing sent or changed.')
+        return contact_capability(c)
+    except Exception:return 'Could not read those Contacts details. Check the name/number and Google suite access. Nothing sent or changed.'
+
+def live_contact_answer(c,text,chat):
+    if not text or not CONTACT_TOPIC.search(text):return None
+    if not drive_link.accounts(c):return contact_capability(c)
+    prompt='Extract only the explicit person/name query from this owner request for Contacts lookup. JSON {query:string}. If no name, ambiguous pronouns, or editing/sending/deleting/exporting is requested, query empty. Do not invent a name or take action.'
+    try:q=json.loads(gemini(prompt,[{"role":"user","parts":[{"text":text}]}],json_out=True,search=False)).get('query','').strip()
+    except Exception:q=''
+    return contact_command(c,'/contacts '+q,chat) if len(q)>=2 else contact_capability(c)
 
 DRIVE_TOPIC=re.compile(r'google drive|google doc|google sheet|find (?:a |my |the )?(?:file|document|spreadsheet)|search (?:my )?drive',re.I)
 
@@ -823,6 +861,11 @@ def reply(c, chat, text, audio=None, note=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    contact_answer=live_contact_answer(c,text,chat)
+    if contact_answer is not None:
+        heard="[voice note] "+text if audio else text
+        c.add_turn(chat,heard,"[Live Contacts lookup handled separately; contact data not saved to conversation history.]")
+        return contact_answer,heard
     drive_answer=live_drive_answer(c,text,chat)
     if drive_answer is not None:
         heard="[voice note] "+text if audio else text
@@ -844,6 +887,7 @@ def reply(c, chat, text, audio=None, note=None):
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     connected_count = len(gmail_link.accounts(c))
     system += "\n\nCURRENT GMAIL CAPABILITY, authoritative over memory and old chat: " + mail_capability(c) + " Never deny inbox access while an account is connected. Do not ask the user to paste or copy email text. Non-sensitive email bodies can be read and summarized through the live Gmail route; attachments and sensitive email are excluded. Never invent mailbox contents. Mail checks are handled separately from this model."
+    system += "\nCURRENT CONTACTS: "+contact_capability(c)+" Never invent contact details or use them to message anyone."
     system += "\nCURRENT GOOGLE FILE TOOLS: "+drive_capability(c)+" Never claim file contents or actions from memory."
     system += "\nCURRENT CALENDAR: " + calendar_capability(c) + " Never claim Calendar actions or contents from chat memory. Schedule queries use the separate live route."
     if note:
@@ -884,6 +928,8 @@ def reply(c, chat, text, audio=None, note=None):
     if not ans or (last and ans.strip() == last[0].strip()):
         print("repeat/empty answer, regenerating")
         ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=USE_GSEARCH) or "Hmm, ek baar phir bolo na? 🙂"
+    if CONTACT_TOPIC.search(ans or ""):
+        ans=contact_capability(c)
     if DRIVE_TOPIC.search(ans or ""):
         ans=drive_capability(c)
     if CAL_TOPIC.search(ans or ""):
@@ -932,6 +978,10 @@ def handle(c, msg):
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
+    if text.split()[0].split('@')[0].lower() in ('/contacts','/contact'):
+        ans=contact_command(c,text,chat)
+        for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
+        return
     if text.split()[0].split('@')[0].lower() in ('/drive','/driveuse','/openfile','/newdoc','/newsheet','/fileconfirm'):
         ans=drive_command(c,text,chat)
         for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
