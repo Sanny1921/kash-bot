@@ -16,6 +16,7 @@ def connect_link(c,email):
     key=secrets.token_urlsafe(32)
     c.kv_set('calendar_launch_'+hashlib.sha256(key.encode()).hexdigest(),json.dumps({'email':email,'until':time.time()+1800}))
     return BASE+'/calendar/connect?'+urllib.parse.urlencode({'key':key})
+@oauth.synchronized
 def authorization(c,key):
     k='calendar_launch_'+hashlib.sha256(key.encode()).hexdigest()
     launch=json.loads(c.kv_get(k) or '{}')
@@ -24,6 +25,7 @@ def authorization(c,key):
     c.kv_set('calendar_state_'+hashlib.sha256(state.encode()).hexdigest(),json.dumps({'email':launch['email'],'verifier':verifier,'until':time.time()+900}))
     challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
     return 'https://accounts.google.com/o/oauth2/v2/auth?'+urllib.parse.urlencode({'client_id':os.environ['GMAIL_CLIENT_ID'],'redirect_uri':BASE+'/gmail/callback','scope':SCOPES,'response_type':'code','access_type':'offline','prompt':'select_account consent','login_hint':launch['email'],'state':state,'code_challenge':challenge,'code_challenge_method':'S256'})
+@oauth.synchronized
 def callback(c,args):
     k='calendar_state_'+hashlib.sha256(args.get('state',[''])[0].encode()).hexdigest();st=json.loads(c.kv_get(k) or '{}')
     if st.get('until',0)<time.time():raise ValueError('invalid state')
@@ -38,6 +40,7 @@ def callback(c,args):
     encrypted=oauth.cipher().encrypt(tok['refresh_token'].encode()).decode()
     saved=accounts(c);saved[st['email']]=encrypted;c.kv_set('calendar_accounts',json.dumps(saved))
     suite=json.loads(c.kv_get('workspace_accounts') or '{}');suite[st['email']]={'refresh':encrypted,'scope':tok['scope']};c.kv_set('workspace_accounts',json.dumps(suite))
+    sources=json.loads(c.kv_get('gmail_sources') or '{}');sources.pop(st['email'],None);c.kv_set('gmail_sources',json.dumps(sources))
     return st['email']
 def token(c,email):
     refresh=oauth.cipher().decrypt(accounts(c)[email].encode()).decode()
