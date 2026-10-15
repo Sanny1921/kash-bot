@@ -10,6 +10,8 @@ import reply_watches
 import notes_log
 import expense_log
 import natural_google
+import file_crud
+import reviews
 import sys
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
@@ -119,6 +121,7 @@ class Health(BaseHTTPRequestHandler):
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
                     "reads non-sensitive email bodies on request and sends selected message text to the configured Gemini model for a summary. It skips attachments, sensitive mail, sending and marking mail as read. Eligible reply drafts also use the configured Gemini model. Each connected account has its own Google consent; the brief labels mail by account. Mail-content questions use live content with sensitive-mail filtering. Optional compose consent enables reply drafts in Gmail, never sending; read access remains available without compose consent. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
+                    "File updates append reviewed plain text to private app-authorized Docs or replace exact Sheet ranges after old/new-cell review. Reviewed deletion moves to Trash, never permanent deletion. Generated document drafts use saved user facts, not inbox scraping. Current Google scopes may prevent changing older files. "
                     "The optional expense log stores only owner-confirmed manual entries in MongoDB with exact integer minor units. Currency/date/amount are previewed; weekly sums separate currencies and include confirmed entries only. It does not access banks/cards, pay, import statements, edit or delete entries. Expense text is not sent to the model. "
                     "Private quick-capture notes are stored in MongoDB separately from chat memory, searched literally and returned only to the owner. They are not sent to the language model. Secret-looking text is rejected; media capture, sharing, editing and deletion are not supported. "
                     "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. Optional reply watches use only Gmail metadata for an owner-confirmed exact sender/thread, checked hourly for up to 30 days; sender identity is not authenticated and offline delays are possible. /replywatches lists/stops watches. No email bodies or outbound messages are used by watches. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
@@ -295,6 +298,8 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
+    if text and re.fullmatch(r'(?:yes|yes please|do it|confirm|go ahead|no|no thanks|cancel|cancel it|हाँ|हां|नहीं)[.!]?',text.strip(),re.I):return None
+    if text and (file_crud.link_id(text) or re.search(r'\b(?:doc(?:ument)?s?|sheets?|spreadsheet|file)\b',text,re.I)):return None
     if text and (natural_google.DOC.match(text.strip()) or natural_google.TASK.match(text.strip()) or natural_google.SELECT.match(text.strip()) or natural_google.CONFIRM.match(text.strip())):return None
     if text and (EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):return None
     if text and (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip())):return None
@@ -834,7 +839,7 @@ def live_contact_answer(c,text,chat):
 DRIVE_TOPIC=re.compile(r'google drive|google doc|google sheet|find (?:a |my |the )?(?:file|document|spreadsheet)|search (?:my )?drive',re.I)
 
 def drive_capability(c):
-    return ("Google file tools are connected for "+', '.join(sorted(drive_link.accounts(c)))+". Use /drive search words, /openfile NUMBER, /driveuse email, /newdoc TITLE then body on new lines, or /newsheet TITLE then tab-separated rows. Only new files after review; no edits to existing files, sharing or deletion.") if drive_link.accounts(c) else 'Connect the Google suite first: /google youraddress@gmail.com. Existing Gmail access stays unchanged.'
+    return ("Google file tools are connected for "+', '.join(sorted(drive_link.accounts(c)))+". Use /drive search words, /openfile NUMBER, /driveuse email, /newdoc TITLE then body on new lines, or /newsheet TITLE then tab-separated rows. New files and app-authorized private-file updates/trash require exact review and confirmation. Docs append text; Sheets update exact ranges. No sharing or permanent deletion.") if drive_link.accounts(c) else 'Connect the Google suite first: /google youraddress@gmail.com. Existing Gmail access stays unchanged.'
 
 def drive_command(c,text,chat):
     parts=text.split(maxsplit=1);cmd=parts[0].split('@')[0].lower();arg=parts[1] if len(parts)>1 else ''
@@ -889,13 +894,15 @@ def drive_command(c,text,chat):
             result=drive_link.create(c,pending['account'],pending['kind'],pending['title'],pending['content'],'drive_creation_'+str(chat)+'_'+pending['code'])
             if result['status']=='unverified':return 'File creation could not be confirmed. Check Drive before making another request. This confirmation will not blindly retry and risk a duplicate.'
             if result['status']=='partial':return 'A file was created but its text/data could not be fully verified. Open it and check before using it. I will not create a duplicate or change an existing file.\n'+result.get('url','')
+            if result.get('id'):
+                file_crud.remember(c,chat,pending['account'],{'id':result['id']})
             return 'Created in '+pending['account']+' My Drive. Text/data was read back and checked. '+('No sharing permissions were found.' if result.get('private') else 'Sharing state needs your review; check file permissions before adding private content.')+' This is a basic text/data file, not a visually checked polished document.\n'+result.get('url','')
         return drive_capability(c)
     except Exception:return 'Could not complete that Google file request. Check the command/account or try /google email to renew consent. No existing file was intentionally changed.'
 
 def live_drive_answer(c,text,chat):
     if not text or not DRIVE_TOPIC.search(text):return None
-    if re.search(r'edit|delete|remove|share|send|change|update',text,re.I):return 'This release searches/reads files and creates new Docs/Sheets after review. It cannot edit existing files, share, send or delete them.'
+    if re.search(r'edit|delete|remove|share|send|change|update',text,re.I):return 'For existing files paste a Google link and ask to append text, update an exact Sheet range, or move to Trash. Every change needs a preview and confirmation; no sharing or permanent deletion.'
     if not drive_link.accounts(c):return drive_capability(c)
     prompt=("Extract the filename/topic query from this owner's request to find a Google Drive file. JSON only: {query:string}. "
             "Only extract explicit search words. If no filename/topic is supplied or the request asks for creation, put query empty. Never execute anything.")
@@ -1089,6 +1096,7 @@ def mail_content_answer(c, text):
 
 def live_mail_answer(c, text, chat=None):
     if not text: return None
+    if file_crud.link_id(text) or re.search(r'\b(?:doc(?:ument)?s?|sheets?|spreadsheet|file)\b',text,re.I):return None
     direct = bool(MAIL_TOPIC.search(text))
     context = json.loads(c.kv_get('mail_context_' + str(chat)) or '{}') if chat is not None else {}
     followup = context.get('until',0)>time.time() and bool(MAIL_FOLLOWUP.search(text)) and bool(MAIL_BODY.search(text) or MAIL_CHECK.search(text))
@@ -1103,6 +1111,10 @@ def live_mail_answer(c, text, chat=None):
     return mail_content_answer(c, text)
 
 def reply(c, chat, text, audio=None, note=None, source_id=None):
+    answer,heard=_reply_core(c,chat,text,audio,note,source_id)
+    return reviews.shown(c,chat,answer),heard
+
+def _reply_core(c, chat, text, audio=None, note=None, source_id=None):
     # Transcribe voice first so the exact same research gate and lookup used for
     # typed messages can run before KASH answers. Do not answer from model memory
     # when the voice transcription itself failed.
@@ -1116,6 +1128,12 @@ def reply(c, chat, text, audio=None, note=None, source_id=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    approval=reviews.approve(c,text or '',chat,sys.modules[__name__])
+    if approval is not None:return approval,text
+    file_answer=file_crud.request(c,text,chat,sys.modules[__name__])
+    if file_answer is not None:
+        c.add_turn(chat,"[Google file request]","[Read or reviewed file change handled separately; content omitted from chat history.]")
+        return file_answer,text
     natural_answer=natural_google.route(c,text,chat,sys.modules[__name__])
     if natural_answer is not None:
         c.add_turn(chat,"[Google tool request]","[Tool preparation handled separately; no private content retained.]")
@@ -1229,8 +1247,19 @@ def handle(c, msg):
     if msg["chat"].get("type") != "private": return
     c.kv_set("owner_chat", chat)  # where proactive messages go
     quoted=msg.get('reply_to_message') or {}
+    if text and re.fullmatch(r'(?:yes|do it|confirm|go ahead)[.!]?',text.strip(),re.I) and quoted.get('text'):
+        latest=reviews.load(c,'latest_google_review_'+str(chat));qcodes=re.findall(r'\b[a-f0-9]{8}\b',quoted['text'])
+        different_quote=(qcodes and latest.get('code') not in qcodes) or ('This review expires in 5 minutes.' in quoted['text'] and __import__('hashlib').sha256(quoted['text'].encode()).hexdigest()!=latest.get('preview_hash'))
+        if different_quote:
+            tg("sendMessage",chat_id=chat,text='That reply refers to an older preview. Please request a fresh review; nothing changed.');return
     if text and re.fullmatch(r'do (?:this|it)[.!]?',text.strip(),re.I) and quoted.get('from',{}).get('id')==uid and quoted.get('text'):
         text=quoted['text']
+    if text and re.search(r'\b(?:fill|append|write|read|open|trash|delete|update)\b',text,re.I) and re.search(r'\b(?:it|this|that)\b',text,re.I) and not file_crud.link_id(text):
+        refs=file_crud.link_id(quoted.get('text',''))
+        if len(refs)==1:
+            observed=re.findall(r'https://[^\s<>]+',quoted.get('text',''))
+            selected=[u for u in observed if refs[0] in u]
+            if selected:text=text+'\n'+selected[0]
     voice = msg.get("voice") or msg.get("audio")
     if voice and not text:
         tg("sendChatAction", chat_id=chat, action="record_voice")
@@ -1251,7 +1280,7 @@ def handle(c, msg):
                 tg("sendMessage", chat_id=chat, text=gemini(SYSTEM, [{"role": "user", "parts": [{"text": res + " Sunny said (voice): " + said + "\nConfirm in one short warm line."}]}]))
         except Exception as e:
             print("voice action failed:", e)
-        if not (natural_google.DOC.match((said or '').strip()) or natural_google.TASK.match((said or '').strip()) or natural_google.SELECT.match((said or '').strip()) or natural_google.CONFIRM.match((said or '').strip()) or NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip()) or EXPENSE_ADD_RE.match((said or '').strip()) or EXPENSE_FIND_RE.match((said or '').strip())):extract(c, said)
+        if not (file_crud.link_id(said or '') or re.search(r'\b(?:doc(?:ument)?s?|sheets?|spreadsheet|file)\b',said or '',re.I) or natural_google.DOC.match((said or '').strip()) or natural_google.TASK.match((said or '').strip()) or natural_google.SELECT.match((said or '').strip()) or natural_google.CONFIRM.match((said or '').strip()) or NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip()) or EXPENSE_ADD_RE.match((said or '').strip()) or EXPENSE_FIND_RE.match((said or '').strip())):extract(c, said)
         return
     if not text:
         return
@@ -1342,7 +1371,7 @@ def handle(c, msg):
         ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
     for offset in range(0,len(ans),3900):
         tg("sendMessage", chat_id=chat, text=ans[offset:offset+3900], disable_web_page_preview=True)
-    if not (natural_google.DOC.match(text.strip()) or natural_google.TASK.match(text.strip()) or natural_google.SELECT.match(text.strip()) or natural_google.CONFIRM.match(text.strip()) or NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip()) or EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):extract(c, text)
+    if not (file_crud.link_id(text) or re.search(r'\b(?:doc(?:ument)?s?|sheets?|spreadsheet|file)\b',text,re.I) or natural_google.DOC.match(text.strip()) or natural_google.TASK.match(text.strip()) or natural_google.SELECT.match(text.strip()) or natural_google.CONFIRM.match(text.strip()) or NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip()) or EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):extract(c, text)
 
 def main():
     srv = serve_health()
