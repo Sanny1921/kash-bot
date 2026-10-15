@@ -180,7 +180,7 @@ def request(c,text,chat,b):
             return perform(c,chat,p['request'],r,b)
     file_context=bool(link_id(s) or re.search(r'\b(?:doc(?:ument)?s?|sheets?|file|spreadsheet)\b',s,re.I))
     head=intent_text(s)
-    updating=bool(re.search(r'\b(?:append|write|fill|update|add (?:text|content)|replace (?:cells|content))\b',head,re.I))
+    updating=bool(re.search(r'\b(?:append|write|fill|update|edit|add (?:text|content)|replace (?:cells|content))\b',head,re.I))
     deleting=bool(re.search(r'\b(?:delete|trash|remove)\b',head,re.I))
     reading=bool(re.search(r'\b(?:read|open|summari[sz]e|show)\b',s,re.I))
     if not ((file_context and (updating or deleting or reading or link_id(s))) or (updating and re.search(r'\b(?:it|this|that)\b',s,re.I))):return None
@@ -202,6 +202,7 @@ def confirm_change(c,chat,code):
 
 def intent_text(s):
     m=re.search(r'(?:containing|with (?:the )?(?:text|content)|append(?: this)?|write(?: this)?|values)\s*:',s,re.I)
+    if not m:m=re.search(r':(?!//)',s)
     head=s[:m.end()] if m else s
     head=re.sub(r'https://[^\s<>]+','[file link]',head)
     return re.sub(r'"[^"]*"', '[title]',head)
@@ -209,7 +210,7 @@ def intent_text(s):
 def perform(c,chat,s,r,b):
     a,f=r['account'],r['id'];m=meta(c,a,f);remember(c,chat,a,m)
     head=intent_text(s)
-    deleting=bool(re.search(r'\b(?:delete|trash|remove)\b',head,re.I));updating=bool(re.search(r'\b(?:append|write|fill|update|add (?:text|content)|replace (?:cells|content))\b',head,re.I))
+    deleting=bool(re.search(r'\b(?:delete|trash|remove)\b',head,re.I));updating=bool(re.search(r'\b(?:append|write|fill|update|edit|add (?:text|content)|replace (?:cells|content))\b',head,re.I))
     if deleting:
         if updating:raise ValueError('Please request one operation: append/update, or move the file to Trash.')
         if re.search(r'\b(?:permanent|forever|purge)\b',s,re.I):raise ValueError('Permanent deletion is not supported. I can prepare a move to Trash instead.')
@@ -218,6 +219,7 @@ def perform(c,chat,s,r,b):
         # Distinguish destructive replacements from the supported append operation.
         if re.search(r'\b(?:replace (?:all|content|text)|overwrite|erase|clear)\b',s,re.I):raise ValueError('This release appends to Docs without replacing existing content. For Sheets it updates an exact range. Please choose append text or an exact cell range.')
         literal=re.search(r'(?:containing|with (?:the )?(?:text|content)|append(?: this)?|write(?: this)?|values)\s*:\s*([\s\S]+)$',s,re.I)
+        if not literal:literal=re.search(r':(?!//)\s*([\s\S]+)$',s)
         if literal:text=literal.group(1)
         elif re.search(r'\b(?:about me|related to me|who i(?: am|.m)|what i(?: do|.m))\b',s,re.I):text=generated(c,s,b)
         elif '\n' in s and not link_id(s.split('\n',1)[0]):text=s.split('\n',1)[1]
