@@ -7,6 +7,7 @@ import drive_link
 import contacts_link
 import tasks_link
 import reply_watches
+import notes_log
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -115,6 +116,7 @@ class Health(BaseHTTPRequestHandler):
                     "It checks recent inbox sender and subject headers for the morning brief, excludes bank, DigiLocker and security mail, "
                     "reads non-sensitive email bodies on request and sends selected message text to the configured Gemini model for a summary. It skips attachments, sensitive mail, sending and marking mail as read. Eligible reply drafts also use the configured Gemini model. Each connected account has its own Google consent; the brief labels mail by account. Mail-content questions use live content with sensitive-mail filtering. Optional compose consent enables reply drafts in Gmail, never sending; read access remains available without compose consent. "
                     "An encrypted refresh token per connected account is stored in Sunny's MongoDB; the encryption key is stored in his Render environment. "
+                    "Private quick-capture notes are stored in MongoDB separately from chat memory, searched literally and returned only to the owner. They are not sent to the language model. Secret-looking text is rejected; media capture, sharing, editing and deletion are not supported. "
                     "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. Optional reply watches use only Gmail metadata for an owner-confirmed exact sender/thread, checked hourly for up to 30 days; sender identity is not authenticated and offline delays are possible. /replywatches lists/stops watches. No email bodies or outbound messages are used by watches. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
@@ -289,6 +291,7 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
+    if text and (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip())):return None
     if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text) or GOOGLE_TASK_TOPIC.search(text) or REPLY_WATCH_TOPIC.search(text)):return None
     """Returns a system-note string describing the action result, or None."""
     if not ACTION_RE.search(text):
@@ -550,6 +553,38 @@ def web_context(text):
         if texts.get(u):
             parts.append(f"\nPAGE CONTENT [{t}] ({u}):\n{texts[u]}")
     return "\n".join(parts)[:14000]
+
+NOTE_SAVE_RE=re.compile(r'^(?:save this|save note|save|remember this note|note this|सेव करो|यह सेव करो)\b[ :\n-]*(.*)$',re.I|re.S)
+NOTE_FIND_RE=re.compile(r'^(?:what did i save about|what have i saved about|find my notes about|search my notes for|notes about)\s*(.*?)\s*[?]?$' ,re.I|re.S)
+
+def notes_command(c,text,chat,source=None):
+    parts=text.split(maxsplit=1);cmd=parts[0].split('@')[0].lower();arg=parts[1].strip() if len(parts)>1 else ''
+    try:
+        if cmd=='/save':
+            if not arg:return 'Send /save followed by the exact text or link. Media capture is not supported yet.'
+            record,duplicate=notes_log.save(c,chat,arg,source)
+            return ('Already saved this message as note ' if duplicate else 'Saved privately as note ')+record['id']+'. /note '+record['id']+' opens it; /notes WORD searches it. Notes persist across restarts and are separate from chat memory.'
+        if cmd=='/notes':
+            rows,total=notes_log.search(c,chat,arg)
+            return '\n'.join(['Saved notes'+(' matching '+arg if arg else '')+':']+[r['id']+' | '+datetime.fromtimestamp(r['created'],IST).strftime('%d %b %Y')+' | '+r['text'][:180].replace('\n',' ') for r in rows]+(['No matches in saved notes. Try another distinctive word.'] if not rows else [])+(['Showing newest 15 of '+str(total)+' matches. Narrow your search.'] if total>15 else [])+['Open exact text: /note ID. No model summary or web lookup used.'])
+        if cmd=='/note':
+            r=notes_log.get(c,chat,arg)
+            return ('Note '+r['id']+' | '+datetime.fromtimestamp(r['created'],IST).strftime('%a %d %b %Y %I:%M%p IST')+'\n'+r['text']) if r else 'That saved note was not found in your private notes.'
+        return 'Notes: /save exact text or link, /notes WORD, /note ID. Plain text/link capture only; no secret storage, automatic sharing, edits or deletion.'
+    except ValueError as e:
+        if 'secret' in str(e):return 'That looks like a password, code, key or card detail, so I did not save it. Use a password manager for secrets.'
+        return 'Could not save that note: use 1-12,000 characters, up to 5,000 saved notes. Nothing saved.'
+    except Exception:return 'Could not verify that note operation. Use /notes to check before saving the same message again.'
+
+def live_notes_answer(c,text,chat,source=None):
+    if not text:return None
+    match=NOTE_SAVE_RE.match(text.strip())
+    if match:
+        if not match.group(1).strip():return 'What exact text or link should I save? Send it after "save this" or /save. I will not guess from older chat.'
+        return notes_command(c,'/save '+match.group(1).strip(),chat,source)
+    match=NOTE_FIND_RE.match(text.strip())
+    if match:return notes_command(c,'/notes '+match.group(1).strip().rstrip('?'),chat,source)
+    return None
 
 REPLY_WATCH_TOPIC=re.compile(r'(?:remind|yaad|याद).*(?:when|once|jab|जब).*(?:reply|replies|mails? back|emails? back|respond|जवाब)',re.I)
 
@@ -980,7 +1015,7 @@ def live_mail_answer(c, text, chat=None):
     # Every mail-topic query takes the live path, not a keyword-limited subset.
     return mail_content_answer(c, text)
 
-def reply(c, chat, text, audio=None, note=None):
+def reply(c, chat, text, audio=None, note=None, source_id=None):
     # Transcribe voice first so the exact same research gate and lookup used for
     # typed messages can run before KASH answers. Do not answer from model memory
     # when the voice transcription itself failed.
@@ -994,6 +1029,10 @@ def reply(c, chat, text, audio=None, note=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    notes_answer=live_notes_answer(c,text,chat,source_id)
+    if notes_answer is not None:
+        c.add_turn(chat,"[Private note save/search request]","[Notes handled separately; content not stored in chat history.]")
+        return notes_answer,text
     watch_answer=live_replywatch_answer(c,text,chat)
     if watch_answer is not None:
         heard="[voice note] "+text if audio else text
@@ -1102,7 +1141,7 @@ def handle(c, msg):
     if voice and not text:
         tg("sendChatAction", chat_id=chat, action="record_voice")
         try:
-            ans, heard = reply(c, chat, None, audio=download_voice(voice["file_id"]))
+            ans, heard = reply(c, chat, None, audio=download_voice(voice["file_id"]),source_id=msg.get('message_id'))
         except Exception as e:
             print("voice failed:", e)
             tg("sendMessage", chat_id=chat, text="Voice note sun nahi paayi, ek baar phir bhejoge? 🙈"); return
@@ -1118,12 +1157,16 @@ def handle(c, msg):
                 tg("sendMessage", chat_id=chat, text=gemini(SYSTEM, [{"role": "user", "parts": [{"text": res + " Sunny said (voice): " + said + "\nConfirm in one short warm line."}]}]))
         except Exception as e:
             print("voice action failed:", e)
-        extract(c, said)
+        if not (NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip())):extract(c, said)
         return
     if not text:
         return
     if text.startswith("/start"):
         tg("sendMessage", chat_id=chat, text="Hey Sunny, KASH here 😊 Bolo, kya chal raha hai?"); return
+    if text.split()[0].split('@')[0].lower() in ('/save','/notes','/note'):
+        ans=notes_command(c,text,chat,msg.get('message_id'))
+        for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
+        return
     if text.split()[0].split('@')[0].lower() in ('/replywatch','/watchthread','/replywatchconfirm','/replywatches','/replywatchcancel'):
         ans=replywatch_command(c,text,chat)
         for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
@@ -1195,13 +1238,13 @@ def handle(c, msg):
         note = None
         try: note = do_action(c, chat, text)
         except Exception as e: print("action failed:", repr(e)[:300])
-        ans, _ = reply(c, chat, text, note=note)
+        ans, _ = reply(c, chat, text, note=note,source_id=msg.get('message_id'))
     except Exception as e:
         print("gemini failed:", e)
         ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
     for offset in range(0,len(ans),3900):
         tg("sendMessage", chat_id=chat, text=ans[offset:offset+3900], disable_web_page_preview=True)
-    extract(c, text)
+    if not (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip())):extract(c, text)
 
 def main():
     srv = serve_health()
