@@ -417,6 +417,8 @@ def day_glance(c, t):
     return lines
 
 def send_brief(c, chat, t):
+    if text and re.fullmatch(r'(?:do this|do it|continue|\?{2,})[.!]?',text.strip(),re.I):
+        return 'Please repeat the exact task or reply directly to your original request. I will prepare it for review, not switch accounts or create anything from a guess.',text
     mem = memories(c)
     glance = day_glance(c, t)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
@@ -1158,6 +1160,8 @@ def reply(c, chat, text, audio=None, note=None, source_id=None):
         # Remember the conversation topic, not private headers to be fed into a model.
         c.add_turn(chat, heard, "[Live Gmail check handled separately; no mailbox content stored in chat history.]")
         return mail_answer, heard
+    if text and re.fullmatch(r'(?:do this|do it|continue|\?{2,})[.!]?',text.strip(),re.I):
+        return 'Please repeat the exact task or reply directly to your original request. I will prepare it for review, not switch accounts or create anything from a guess.',text
     mem = memories(c)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
     connected_count = len(gmail_link.accounts(c))
@@ -1166,6 +1170,7 @@ def reply(c, chat, text, audio=None, note=None, source_id=None):
     system += "\nCURRENT CONTACTS: "+contact_capability(c)+" Never invent contact details or use them to message anyone."
     system += "\nCURRENT GOOGLE FILE TOOLS: "+drive_capability(c)+" Never claim file contents or actions from memory."
     system += "\nCURRENT CALENDAR: " + calendar_capability(c) + " Never claim Calendar actions or contents from chat memory. Schedule queries use the separate live route."
+    system += "\nStay on the newest request. Never bring up mood, feeling low, emotional state or check-ins unless Sunny asks for emotional support now. Old chat/memory about mood is not a reason to interrupt a task. Do not recite permission or privacy policy blocks. Do not recommend slash commands for supported natural-language tasks; give a plain-language example and ask only the missing detail."
     if note:
         system += "\n\n" + note
     if text and WEB_RE.search(text):
@@ -1204,18 +1209,11 @@ def reply(c, chat, text, audio=None, note=None, source_id=None):
     if not ans or (last and ans.strip() == last[0].strip()):
         print("repeat/empty answer, regenerating")
         ans = gemini(system + "\n\nIMPORTANT: Your last reply was identical or empty. Answer Sunny's newest message freshly and specifically; do not repeat any earlier reply.", contents, search=USE_GSEARCH) or "Hmm, ek baar phir bolo na? 🙂"
-    if GOOGLE_TASK_TOPIC.search(ans or ""):
-        ans=tasks_capability(c)
-    if CONTACT_TOPIC.search(ans or ""):
-        ans=contact_capability(c)
-    if DRIVE_TOPIC.search(ans or ""):
-        ans=drive_capability(c)
-    if CAL_TOPIC.search(ans or ""):
-        ans = calendar_capability(c)
-    if MAIL_TOPIC.search(ans or ""):
-        # The model is never authoritative about Gmail permissions or contents.
-        # A generated mail claim is replaced even after the regeneration path.
-        ans = mail_capability(c)
+    if any(pattern.search(ans or "") for pattern in (GOOGLE_TASK_TOPIC,CONTACT_TOPIC,DRIVE_TOPIC,CAL_TOPIC,MAIL_TOPIC)):
+        # A model mention is not a reason to dump every tool's permission policy.
+        ans = 'Please tell me the exact Google task you want. For example, "create a docs file named sunny", "show my day tomorrow", or "find my doc about physics". I will use live tools and show a review before creating anything.'
+    if not re.search(r'\b(?:mood|sad|upset|anxious|depressed|lonely|feeling low|feel low|mental health)\b|उदास|अकेला',text or '',re.I) and re.search(r'(?:mood|man|mann) kaisa|(?:abhi bhi|still|feeling|feel) low|thoda behtar|how (?:are you feeling|is your mood)',ans or '',re.I):
+        ans='What would you like me to do next?'
     if audio:
         heard = "[voice note] " + text
     c.add_turn(chat, heard, ans)
@@ -1230,6 +1228,9 @@ def handle(c, msg):
     if not OWNER_ID and saved_owner and str(chat) != str(saved_owner): return
     if msg["chat"].get("type") != "private": return
     c.kv_set("owner_chat", chat)  # where proactive messages go
+    quoted=msg.get('reply_to_message') or {}
+    if text and re.fullmatch(r'do (?:this|it)[.!]?',text.strip(),re.I) and quoted.get('from',{}).get('id')==uid and quoted.get('text'):
+        text=quoted['text']
     voice = msg.get("voice") or msg.get("audio")
     if voice and not text:
         tg("sendChatAction", chat_id=chat, action="record_voice")
