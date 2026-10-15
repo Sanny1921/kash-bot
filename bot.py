@@ -9,6 +9,8 @@ import tasks_link
 import reply_watches
 import notes_log
 import expense_log
+import natural_google
+import sys
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
 import html as htmlmod, urllib.parse, xml.etree.ElementTree as ET
@@ -293,6 +295,7 @@ def parse_action(c, text):
         print("parse_action failed:", e); return None
 
 def do_action(c, chat, text):
+    if text and (natural_google.DOC.match(text.strip()) or natural_google.TASK.match(text.strip()) or natural_google.SELECT.match(text.strip()) or natural_google.CONFIRM.match(text.strip())):return None
     if text and (EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):return None
     if text and (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip())):return None
     if text and (CAL_TOPIC.search(text) or DRIVE_TOPIC.search(text) or CONTACT_TOPIC.search(text) or GOOGLE_TASK_TOPIC.search(text) or REPLY_WATCH_TOPIC.search(text)):return None
@@ -998,7 +1001,9 @@ def live_calendar_answer(c,text,chat):
         if data.get('intent')!='create':return calendar_capability(c)
         if data.get('involves_others') or data.get('ambiguity'):return data.get('ambiguity') or 'Is this only a private calendar note? Guest invitations are not supported in this release.'
         dest=json.loads(c.kv_get('calendar_destination_'+str(chat)) or '{}')
-        if not dest:return 'First choose the calendar for new events: /calendaraccounts, then /calendaruse NUMBER.'
+        if not dest or re.search(r'\b(?:personal|college)\b',text,re.I) or natural_google.aliases(c).get('personal'):
+            dest,error=natural_google.destination(c,chat,sys.modules[__name__],'calendar',text)
+            if error:return error
         if dest['account'] not in calendar_link.accounts(c):return 'The chosen Calendar account was disconnected. Choose again with /calendaraccounts.'
         start=datetime.fromisoformat(data['start_date']+'T'+data['start_time']).replace(tzinfo=IST)
         duration=int(data.get('duration_minutes',30))
@@ -1109,6 +1114,10 @@ def reply(c, chat, text, audio=None, note=None, source_id=None):
             raise ValueError("empty voice transcription")
         text = tx
 
+    natural_answer=natural_google.route(c,text,chat,sys.modules[__name__])
+    if natural_answer is not None:
+        c.add_turn(chat,"[Google tool request]","[Tool preparation handled separately; no private content retained.]")
+        return natural_answer,text
     expense_answer=live_expense_answer(c,text,chat,source_id)
     if expense_answer is not None:
         c.add_turn(chat,"[Private expense log request]","[Expense preview/summary handled separately; no expense content stored in chat history.]")
@@ -1241,7 +1250,7 @@ def handle(c, msg):
                 tg("sendMessage", chat_id=chat, text=gemini(SYSTEM, [{"role": "user", "parts": [{"text": res + " Sunny said (voice): " + said + "\nConfirm in one short warm line."}]}]))
         except Exception as e:
             print("voice action failed:", e)
-        if not (NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip()) or EXPENSE_ADD_RE.match((said or '').strip()) or EXPENSE_FIND_RE.match((said or '').strip())):extract(c, said)
+        if not (natural_google.DOC.match((said or '').strip()) or natural_google.TASK.match((said or '').strip()) or natural_google.SELECT.match((said or '').strip()) or natural_google.CONFIRM.match((said or '').strip()) or NOTE_SAVE_RE.match((said or '').strip()) or NOTE_FIND_RE.match((said or '').strip()) or EXPENSE_ADD_RE.match((said or '').strip()) or EXPENSE_FIND_RE.match((said or '').strip())):extract(c, said)
         return
     if not text:
         return
@@ -1332,7 +1341,7 @@ def handle(c, msg):
         ans = "Ek sec, mera dimaag thoda atak gaya. Dobara bologe?"
     for offset in range(0,len(ans),3900):
         tg("sendMessage", chat_id=chat, text=ans[offset:offset+3900], disable_web_page_preview=True)
-    if not (NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip()) or EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):extract(c, text)
+    if not (natural_google.DOC.match(text.strip()) or natural_google.TASK.match(text.strip()) or natural_google.SELECT.match(text.strip()) or natural_google.CONFIRM.match(text.strip()) or NOTE_SAVE_RE.match(text.strip()) or NOTE_FIND_RE.match(text.strip()) or EXPENSE_ADD_RE.match(text.strip()) or EXPENSE_FIND_RE.match(text.strip())):extract(c, text)
 
 def main():
     srv = serve_health()
