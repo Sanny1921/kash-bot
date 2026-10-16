@@ -11,7 +11,7 @@ in chat. State lives in the kv store, so MongoDB and sqlite both work.
 import hashlib, hmac, json, re, secrets, threading, time, urllib.parse
 import urllib.request
 
-AUTO_ACTIONS = {"list", "read", "write", "append", "browse", "openurl"}
+AUTO_ACTIONS = {"list", "read", "write", "append", "browse", "openurl", "ytcontrol"}
 ASK_ACTIONS = {"delete", "run", "open"}
 ONLINE_SECONDS = 120
 JOB_KEEP = 86400
@@ -26,6 +26,46 @@ PAIR_RE = re.compile(r'\bpair\b|\bconnect\b|\bjod(?:o|na)?\b', re.I)
 LISTQ_RE = re.compile(r'which (?:device|machine)|what machine|devices? (?:are )?(?:connected|paired|online)|(?:laptop|computer|phone) (?:online|connected|paired)|kahan chal rahi|kis machine|kaunse device', re.I)
 YT_RE = re.compile(r'\b(?:youtube|yt|play|gana|gaana|song|songs|sunao|chala(?:o|na)?|bajao)\b', re.I)
 YT_STRIP = re.compile(r'\b(?:please|pls|kash|on|in|my|the|laptop|computer|youtube|yt|play|open|search|for|a|song|songs|gana|gaana|sunao|chalao|chala|chalana|bajao|kholo|karo|kar|do|de|mujhe|mera|meri|ko|pe|par|se|and|then)\b', re.I)
+# Playback controls (plain words + Hinglish). A message that is ONLY control words
+# (plus filler) is a playback command and must never be treated as a song title.
+_CTRL_FILLER = frozenset((
+    'please pls plz plzz kash hey the a an on in of my mere mera meri laptop computer pc tab tabs browser window '
+    'youtube yt song songs gaana gana gaane gaano music video current currently playing played this that it is '
+    'ko kar karo karna kare do de dijiye dena na yaar abhi thoda thodi thode pe par se bhi zara jara wala wali '
+    'now player volume sound awaaz awaz aawaz chalao chala chalo chalana sunao bajao baja lagao jao go toh to '
+    'for me and or track usko isko woh play played'
+).split())
+_CTRL_PLAY_HINT = frozenset(('play chalao chala chalo chalana sunao bajao baja lagao'.split()))
+_CTRL_WORDS = [
+    ('pause', frozenset('stop pause ruk ruko roko rukna hold wait bas thamb'.split())),
+    ('resume', frozenset('resume continue unpause chalu'.split())),
+    ('next', frozenset('next agla agli aage forward skip'.split())),
+    ('previous', frozenset('previous prev back pichla pichli peeche piche last wapas'.split())),
+    ('replay', frozenset('replay restart repeat dobara phir phirse firse'.split())),
+    ('close', frozenset('close band exit'.split())),
+    ('volume_up', frozenset('up louder badha badhao badhana tez increase zyada jyada'.split())),
+    ('volume_down', frozenset('down lower softer kam dheere decrease ghatao ghata'.split())),
+    ('mute', frozenset('mute muted silent chup khamosh'.split())),
+    ('unmute', frozenset('unmute unmuted'.split())),
+]
+
+
+def _control_op(text):
+    """Plain-word playback command -> op, else None. Matches only when every non-filler
+    word is a control word of ONE op, so song titles with other words stay song searches."""
+    norm = re.sub(r'[^\w\s]', ' ', text.lower())
+    tokens = norm.split()
+    if not tokens:
+        return None
+    rest = [t for t in tokens if t not in _CTRL_FILLER]
+    if not rest:
+        return 'resume' if any(t in _CTRL_PLAY_HINT for t in tokens) else None
+    for op, words in _CTRL_WORDS:
+        if all(t in words for t in rest):
+            return op
+    return None
+
+
 BROWSE_RE = re.compile(r'(?:digi+campus|assignments?)', re.I)
 BROWSE_ACT = re.compile(r'\b(?:check|pending|due|dekh|dekho|batao|open|read|kya|any|list|show|status)\b', re.I)
 ACT_RE = re.compile(r'\b(?:list|show|read|open|create|write|make|delete|remove|append|add|run|execute|install|files?|folder|directory|command|dikhao|banao|padho|hatao|chalao|kholo|likho)\b', re.I)
@@ -93,7 +133,7 @@ def capability(c):
         state = 'online' if now - dev.get('last_seen', 0) < ONLINE_SECONDS else 'offline'
         parts.append('%s (%s, %s, folder %s)' % (dev['name'], dev.get('os', '?'), state, dev.get('root', '~/KASH')))
     return ('Local devices: ' + '; '.join(parts) + '. AUTO actions inside each device folder: list, read, create, append. '
-            'Also AUTO: opening YouTube search/pages and reading DigiCampus in his laptop browser (so never say you cannot open YouTube or play songs while a device is paired - the router does it; if you are answering here, tell him to say e.g. "play majaal song"). '
+            'Also AUTO: opening YouTube songs and CONTROLLING playback in his laptop browser (pause/resume/next/previous/replay/close tab/volume up/down/mute) plus reading DigiCampus (so never say you cannot open YouTube or play or control songs while a device is paired - the router does it; if you are answering here, tell him to say e.g. "play majaal song", then "agla gaana", "pause", "volume kam karo"). '
             'Delete, run command and open need his Telegram confirmation first. '
             'Never claim a device action happened unless a system note says it completed.')
 
@@ -351,6 +391,10 @@ def route(c, text, chat, b):
                 dev = d[ids[idx]]
                 return _dispatch_for(c, chat, dev, p['request'], data)
         return None
+    if devices(c):
+        op = _control_op(stripped)
+        if op:
+            return _yt_control(c, chat, op)
     if YT_RE.search(stripped) and devices(c) and not BROWSE_RE.search(stripped) and not re.search(r'\b(?:delete|remove|run|install|file|folder)\b', stripped, re.I):
         q = re.sub(r'\s+', ' ', YT_STRIP.sub(' ', re.sub(r'[^\w\s]', ' ', stripped))).strip()
         return _youtube_start(c, chat, q, stripped)
@@ -408,6 +452,45 @@ def _youtube_start(c, chat, q, original):
     if done and done['status'] == 'failed':
         return '❌ YouTube nahi khul paya: ' + _clean(done.get('error'), 300)
     return '%s abhi offline lag raha hai. Helper chalu hote hi YouTube khol dungi.' % dev['name']
+
+
+_CTRL_REPLY = {
+    'pause': 'Rok diya 🙂 pause hai - bolo "resume" ya "chalu karo" jab wapas chalana ho.',
+    'resume': 'Chalu kar diya 🙂',
+    'next': 'Agla chala diya 🙂',
+    'previous': 'Pichla chala diya 🙂',
+    'replay': 'Phir se shuru kar diya 🙂',
+    'close': 'Band kar diya 🙂 YouTube wali tab close ho gayi.',
+    'volume_up': 'Volume badha diya 🔊',
+    'volume_down': 'Volume kam kar diya 🔉',
+    'mute': 'Mute kar diya 🔇',
+    'unmute': 'Awaaz wapas aa gayi 🔊',
+}
+
+
+def _yt_control(c, chat, op):
+    """Playback control on the YouTube tab the helper opened. AUTO - pausing a song
+    or nudging volume changes nothing on disk."""
+    d = devices(c)
+    if not d:
+        return None
+    online = [x for x in d.values() if time.time() - x.get('last_seen', 0) < ONLINE_SECONDS] or list(d.values())
+    dev = sorted(online, key=lambda x: -x.get('last_seen', 0))[0]
+    job = enqueue(c, chat, dev['id'], 'ytcontrol', {'op': op}, True)
+    done = wait_result(c, job['id'], timeout=10)
+    if done and done['status'] == 'done':
+        out = str(done.get('output') or '')
+        if out.startswith(('playing:', 'replaying:')):
+            title = out.split(':', 1)[1].strip()
+            base = _CTRL_REPLY.get(op, 'Ho gaya 🙂')
+            return base + ('\nAb chal raha: ' + title if title else '')
+        if out.startswith('volume '):
+            level = out.split(' ', 1)[1]
+            return ('Volume ab %s 🔊' if op == 'volume_up' else 'Volume ab %s 🔉') % level
+        return _CTRL_REPLY.get(op, 'Ho gaya 🙂')
+    if done and done['status'] == 'failed':
+        return '❌ ' + _clean(done.get('error'), 300)
+    return '%s abhi offline lag raha hai - abhi playback control nahi ho payega. Helper chalu hote hi try karna.' % dev['name']
 
 
 def _browse_start(c, chat, request):

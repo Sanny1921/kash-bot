@@ -17,6 +17,7 @@ import base64, getpass, json, os, re, sys, time
 DIR = os.path.join(os.path.expanduser("~"), ".kash")
 LOGINS = os.path.join(DIR, "logins.json")
 PROFILE = os.path.join(DIR, "browser-profile")
+PROFILE_MEDIA = os.path.join(DIR, "browser-profile-media")  # separate: YouTube playback, no saved logins needed
 UNSAFE = re.compile(r"submit|delete|remove|pay|buy|upload|send|confirm|save|post|logout|log out|sign out|enroll|withdraw", re.I)
 NAV = re.compile(r"assignment|pending|to.?do|task|submission|due|upcoming|course|deadline", re.I)
 
@@ -101,13 +102,13 @@ def list_logins():
 
 
 # ---------- browsing (read-only) ----------
-def _launch(p):
-    os.makedirs(PROFILE, exist_ok=True)
+def _launch(p, profile=PROFILE):
+    os.makedirs(profile, exist_ok=True)
     last = None
     for channel in ("chrome", "msedge", None):
         try:
             kw = {"channel": channel} if channel else {}
-            return p.chromium.launch_persistent_context(PROFILE, headless=False, **kw)
+            return p.chromium.launch_persistent_context(profile, headless=False, **kw)
         except Exception as e:
             last = e
     raise RuntimeError("No Chrome/Edge found and no Playwright browser installed (%s). "
@@ -224,13 +225,200 @@ def browse(args):
             ctx.close()
 
 
+# ---------- YouTube playback browser (persistent, KASH-controlled) ----------
+_MEDIA = {"p": None, "ctx": None, "page": None, "history": [], "idx": -1}
+
+
+def _media_reset():
+    ctx, p = _MEDIA.get("ctx"), _MEDIA.get("p")
+    _MEDIA.update({"p": None, "ctx": None, "page": None, "history": [], "idx": -1})
+    try:
+        if ctx is not None:
+            ctx.close()
+    except Exception:
+        pass
+    try:
+        if p is not None:
+            p.stop()
+    except Exception:
+        pass
+
+
+def _media_page(launch):
+    """Live page in the persistent media browser. launch=False never starts one
+    (control ops should fail cleanly when nothing is open)."""
+    ctx = _MEDIA.get("ctx")
+    if ctx is not None:
+        try:
+            page = _MEDIA.get("page")
+            if page is None or page.is_closed():
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                _MEDIA["page"] = page
+            return page, ""
+        except Exception:
+            _media_reset()  # window was closed / context died
+    if not launch:
+        return None, "no media browser"
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None, "Playwright missing. Run: pip install playwright  (then restart the helper)"
+    try:
+        if _MEDIA.get("p") is None:
+            _MEDIA["p"] = sync_playwright().start()
+        ctx = _launch(_MEDIA["p"], PROFILE_MEDIA)
+        _MEDIA["ctx"] = ctx
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        _MEDIA["page"] = page
+        return page, ""
+    except Exception as e:
+        _media_reset()
+        return None, "browser nahi khul paya: %s" % str(e)[:150]
+
+
+def _title(page):
+    try:
+        t = page.evaluate("""() => {
+            const h = document.querySelector('h1.ytd-watch-metadata yt-formatted-string, h1.title yt-formatted-string');
+            return (h && h.textContent.trim()) || document.title.replace(/ - YouTube$/, '');
+        }""")
+        return (t or "").strip()[:120]
+    except Exception:
+        return ""
+
+
 def open_url(args):
-    """Open an https YouTube page in the default Chrome profile window. Narrow allowlist."""
-    import webbrowser
+    """Open an https YouTube page in the persistent media browser so playback stays
+    controllable. Narrow allowlist: https youtube.com / youtu.be only."""
     from urllib.parse import urlparse
     u = urlparse(str(args.get("url", "")))
     host = (u.hostname or "").lower()
     if u.scheme != "https" or not (host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be"):
         return False, "", "Sirf YouTube links khol sakti hoon."
-    webbrowser.open(u.geturl())
-    return True, "opened " + u.geturl(), ""
+    url = u.geturl()
+    page, err = _media_page(launch=True)
+    if page is None:
+        # Fallback: default browser opens the song, but playback control will not work there.
+        try:
+            import webbrowser
+            if webbrowser.open(url):
+                return True, "opened " + url + " (default browser, no playback control: %s)" % err, ""
+            return False, "", "browser nahi khul paya: %s" % err
+        except Exception as e:
+            return False, "", str(e)[:150]
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.bring_to_front()
+    except Exception as e:
+        return False, "", "YouTube nahi khul paya: %s" % str(e)[:150]
+    hist, idx = _MEDIA["history"], _MEDIA["idx"]
+    if idx < 0 or hist[idx] != url:
+        _MEDIA["history"] = hist[:idx + 1] + [url]
+        _MEDIA["idx"] = idx + 1
+    return True, "opened " + url, ""
+
+
+_VIDEO_JS = """(op) => {
+    const v = document.querySelector('video');
+    if (!v) return 'novideo';
+    if (op === 'pause') { v.pause(); return 'ok'; }
+    if (op === 'resume') { v.play(); return 'ok'; }
+    if (op === 'replay') { v.currentTime = 0; v.play(); return 'ok'; }
+    if (op === 'volume_up') { v.muted = false; v.volume = Math.min(1, Math.round((v.volume + 0.2) * 5) / 5); return String(Math.round(v.volume * 100)); }
+    if (op === 'volume_down') { v.volume = Math.max(0, Math.round((v.volume - 0.2) * 5) / 5); return String(Math.round(v.volume * 100)); }
+    if (op === 'mute') { v.muted = true; return 'ok'; }
+    if (op === 'unmute') { v.muted = false; return 'ok'; }
+    return 'badop';
+}"""
+
+
+def _wait_title(page, timeout=12):
+    """Poll for a real video title after navigation (h1 and document.title lag; the
+    page shows 'YouTube' or '- YouTube' until the watch metadata hydrates)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        t = _title(page)
+        if t and t.strip().lstrip("-").strip().lower() not in ("", "youtube"):
+            return t
+        time.sleep(0.7)
+    return ""
+
+
+def _vid(url):
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url or "")
+    return m.group(1) if m else ""
+
+
+_RELATED_JS = """(cur) => {
+    const out = [];
+    for (const a of document.querySelectorAll("ytd-compact-video-renderer a#thumbnail[href*='watch'], ytd-video-renderer a#thumbnail[href*='watch'], a#thumbnail[href*='watch']")) {
+        if (a.href && !a.href.includes(cur) && !out.includes(a.href)) out.push(a.href);
+        if (out.length >= 3) break;
+    }
+    return out;
+}"""
+
+
+def media_control(args):
+    """Playback control on the YouTube tab KASH opened. Never launches a browser."""
+    op = str(args.get("op", "")).strip().lower()
+    page, _ = _media_page(launch=False)
+    if page is None:
+        return False, "", ("Abhi koi YouTube tab mere control mein nahi hai is device pe - "
+                           "pehle koi gaana chalwao, jaise 'play majaal song'.")
+    try:
+        if op == "close":
+            try:
+                page.close()
+            except Exception:
+                pass
+            _MEDIA["page"] = None
+            return True, "closed", ""
+        if op == "previous":
+            # Own watch-history stack: full navigations only. YouTube's SPA soft-nav
+            # (next-button click / history back) can leave the player unhydrated.
+            hist, idx = _MEDIA["history"], _MEDIA["idx"]
+            if idx <= 0:
+                return False, "", "Koi pichla gaana nahi hai - yahi pehla gaana tha."
+            _MEDIA["idx"] = idx - 1
+            page.goto(hist[idx - 1], wait_until="domcontentloaded", timeout=45000)
+            return True, "playing: " + _wait_title(page), ""
+        if op == "next":
+            hist, idx = _MEDIA["history"], _MEDIA["idx"]
+            if idx + 1 < len(hist):
+                url = hist[idx + 1]
+            else:
+                urls = page.evaluate(_RELATED_JS, _vid(page.url))
+                if not urls:
+                    # DOM may still be rendering after a recent navigation - retry once.
+                    time.sleep(1.5)
+                    urls = page.evaluate(_RELATED_JS, _vid(page.url))
+                if not urls:
+                    return False, "", "Agla gaana nahi mila is page pe."
+                url = urls[0]
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            if idx + 1 < len(_MEDIA["history"]):
+                _MEDIA["idx"] = idx + 1
+            else:
+                _MEDIA["history"] = hist[:idx + 1] + [url]
+                _MEDIA["idx"] = idx + 1
+            return True, "playing: " + _wait_title(page), ""
+        if op in ("pause", "resume", "replay", "volume_up", "volume_down", "mute", "unmute"):
+            r = page.evaluate(_VIDEO_JS, op)
+            if r in ("novideo", "badop"):
+                return False, "", "Is tab pe koi video nahi chal raha."
+            if op == "pause":
+                return True, "paused", ""
+            if op == "resume":
+                return True, "playing: " + _title(page), ""
+            if op == "replay":
+                return True, "replaying: " + _title(page), ""
+            if op in ("volume_up", "volume_down"):
+                return True, "volume %s%%" % r, ""
+            return True, ("muted" if op == "mute" else "unmuted"), ""
+        return False, "", "unknown control op: " + op
+    except Exception as e:
+        return False, "", "playback control nahi ho paya: %s" % str(e)[:150]
