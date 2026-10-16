@@ -23,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TG = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+FALLBACK_MODELS = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash").split(",") if m.strip()]
+MODELS = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
 OWNER_ID = os.environ.get("OWNER_TELEGRAM_ID")  # optional: lock bot to Sunny's Telegram user id
 DB = os.environ.get("KASH_DB", "kash.db")
 MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
@@ -153,26 +155,38 @@ def tg(method, **kw):
     return post(f"https://api.telegram.org/bot{TG}/{method}", kw, 70)
 
 def gemini(system, contents, json_out=False, search=False, require_search=False):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
     body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
     if json_out: body["generationConfig"] = {"responseMimeType": "application/json"}
     attempts = [[{"google_search": {}}, {"url_context": {}}], [{"google_search": {}}]] + ([] if require_search else [None]) if (search and not json_out) else [None]
     r = None
-    for tools_cfg in attempts:
-        if tools_cfg: body["tools"] = tools_cfg
-        else: body.pop("tools", None)
-        try:
-            r = post(url, body, 120)
-            cand = r["candidates"][0]
-            if not cand.get("content", {}).get("parts"):
-                raise ValueError("empty candidate: " + str(cand.get("finishReason")))
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        for tools_cfg in attempts:
+            if tools_cfg: body["tools"] = tools_cfg
+            else: body.pop("tools", None)
+            for retry in range(2):
+                try:
+                    r = post(url, body, 120)
+                    cand = r["candidates"][0]
+                    if not cand.get("content", {}).get("parts"):
+                        raise ValueError("empty candidate: " + str(cand.get("finishReason")))
+                    break
+                except urllib.error.HTTPError as e:
+                    print("gemini HTTP", e.code, "model=", model, "tools=", bool(tools_cfg), e.read()[:400])
+                    r = None
+                    if e.code in (429, 500, 503) and retry == 0:
+                        time.sleep(4)  # high-demand spikes are usually seconds-long
+                        continue
+                    break
+                except Exception as e:
+                    print("gemini error model=", model, "tools=", bool(tools_cfg), repr(e)[:300])
+                    r = None
+                    break
+            if r is not None:
+                break
+        if r is not None:
+            if model != MODEL: print("gemini answered with fallback model:", model)
             break
-        except urllib.error.HTTPError as e:
-            print("gemini HTTP", e.code, "tools=", bool(tools_cfg), e.read()[:400])
-            r = None
-        except Exception as e:
-            print("gemini error tools=", bool(tools_cfg), repr(e)[:300])
-            r = None
     if r is None:
         raise RuntimeError("all gemini attempts failed")
     out = "".join(p.get("text", "") for p in cand["content"]["parts"]).strip()
