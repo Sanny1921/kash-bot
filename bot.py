@@ -151,6 +151,8 @@ class Health(BaseHTTPRequestHandler):
 def serve_health(c=None):
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Health)
     srv.store = c
+    import wake_link
+    device_agent.SAY_HOOK = lambda st, chat, text: wake_link.say(st, sys.modules[__name__], chat, text)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"health server on :{PORT}")
     return srv
@@ -162,6 +164,15 @@ def post(url, body, timeout=60):
 
 def tg(method, **kw):
     return post(f"https://api.telegram.org/bot{TG}/{method}", kw, 70)
+
+_TL = threading.local()
+_tg_raw = tg
+def tg(method, **kw):
+    r = _tg_raw(method, **kw)
+    cap = getattr(_TL, "cap", None)
+    if cap is not None and method == "sendMessage":
+        cap.append(kw.get("text", ""))
+    return r
 
 def gemini(system, contents, json_out=False, search=False, require_search=False):
     body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
