@@ -30,3 +30,13 @@ Deploy; logs should say `KASH is up. memory: mongodb`.
 **3. Keep it awake (cron-job.org).** Free web services sleep after 15 min without inbound HTTP. Create a cron job at cron-job.org with URL `https://<your-service>.onrender.com/health`, every 10 minutes. The bot answers `ok`.
 
 Note: Render free gives about 750 instance-hours per month per workspace.
+
+## Local access (v6): KASH on your own devices
+
+`kash_helper.py` runs on Sunny's laptop/phone and polls this bot outward over
+HTTPS - no open ports on the device. Pairing: tell KASH "pair my laptop",
+enter the one-time 6-digit code in the helper. Scope: one folder per device
+(default `~/KASH`); list/read/create/append run directly, delete/run/open ask
+Sunny on Telegram first. Setup steps: see `HELPER.md`. Server side lives in
+`device_agent.py` (`/agent/pair`, `/agent/poll`, `/agent/result`); tests in
+`test_local_access.py`.
