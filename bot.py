@@ -370,9 +370,7 @@ def scheduler(c):
                 reply_watches.check(c,lambda target,message:tg("sendMessage",chat_id=target,text=message,disable_web_page_preview=True))
                 t = datetime.now(IST)
                 today = t.strftime("%Y-%m-%d")
-                if t.hour >= BRIEF_HOUR and t.hour < 22 and c.kv_get("last_brief") != today:
-                    c.kv_set("last_brief", today)  # set first: never double-send
-                    threading.Thread(target=send_brief, args=(c, chat, t), daemon=True).start()
+                schedule_brief(c, chat, t)
                 news_retry(c, chat, t)
         except Exception as e:
             print("scheduler error:", repr(e)[:300])
@@ -421,9 +419,78 @@ def day_glance(c, t):
     lines += [f"- (coming up) {d['text']} - {fmt_ist(d['due'])}" for d in later[:4]]
     return lines
 
+BRIEF_LOCK = threading.Lock()
+BRIEF_WORKER = None
+
+def brief_state(c, day):
+    return json.loads(c.kv_get("brief_delivery_v2_" + day) or '{}')
+
+def save_brief_state(c, day, state):
+    c.kv_set("brief_delivery_v2_" + day, json.dumps(state))
+
+def schedule_brief(c, chat, t):
+    """Catch up after restarts, but never call a failed run 'sent'."""
+    global BRIEF_WORKER
+    if not BRIEF_HOUR <= t.hour < 22: return
+    day = t.strftime("%Y-%m-%d")
+    state = brief_state(c, day)
+    if state.get('status') in ('done', 'uncertain', 'failed'): return
+    if state.get('retry_at', 0) > time.time(): return
+    with BRIEF_LOCK:
+        if BRIEF_WORKER is not None and BRIEF_WORKER.is_alive(): return
+        BRIEF_WORKER = threading.Thread(target=run_brief, args=(c, chat, t), daemon=True)
+        BRIEF_WORKER.start()
+
+def run_brief(c, chat, t):
+    day = t.strftime("%Y-%m-%d")
+    state = brief_state(c, day)
+    # A process can die after Telegram accepted a send but before DB checkpoint.
+    # Do not replay such a message blindly: Telegram offers no idempotency key.
+    if state.get('sending'):
+        state['status'] = 'uncertain'
+        save_brief_state(c, day, state)
+        print('brief delivery uncertain', day, state['sending'])
+        return
+    state['attempts'] = state.get('attempts', 0) + 1
+    state['status'] = 'running'
+    save_brief_state(c, day, state)
+    try:
+        send_brief(c, chat, t)
+        state = brief_state(c, day)
+        state.update(status='done', completed_at=time.time())
+        save_brief_state(c, day, state)
+        c.kv_set('last_brief', day)  # legacy compatibility, only after success
+        print('brief delivered', day, 'parts', len(state.get('sent', {})))
+    except Exception as e:
+        state = brief_state(c, day)
+        state['status'] = 'uncertain' if state.get('sending') else ('failed' if state['attempts'] >= 3 else 'retry')
+        state['retry_at'] = time.time() + 300
+        state['error'] = type(e).__name__
+        save_brief_state(c, day, state)
+        print('brief delivery', state['status'], day, type(e).__name__)
+
+def brief_send(c, chat, t, part, message):
+    day = t.strftime("%Y-%m-%d")
+    state = brief_state(c, day)
+    if part in state.get('sent', {}): return
+    if state.get('sending'): raise RuntimeError('Uncertain previous delivery')
+    state['sending'] = part
+    save_brief_state(c, day, state)
+    try:
+        result = tg('sendMessage', chat_id=chat, text=message, disable_web_page_preview=True)
+        if not result.get('ok'):
+            raise ValueError('Telegram rejected message')
+    except (urllib.error.HTTPError, ValueError):
+        # A concrete API rejection is safe to retry. Transport timeouts are not.
+        state.pop('sending', None)
+        save_brief_state(c, day, state)
+        raise
+    state.setdefault('sent', {})[part] = result.get('result', {}).get('message_id')
+    state.pop('sending', None)
+    save_brief_state(c, day, state)
+    print('brief part delivered', day, part)
+
 def send_brief(c, chat, t):
-    if text and re.fullmatch(r'(?:do this|do it|continue|\?{2,})[.!]?',text.strip(),re.I):
-        return 'Please repeat the exact task or reply directly to your original request. I will prepare it for review, not switch accounts or create anything from a guess.',text
     mem = memories(c)
     glance = day_glance(c, t)
     system = SYSTEM + ("\n\nWhat you remember about Sunny:\n- " + "\n- ".join(mem[-60:]) if mem else "")
@@ -437,26 +504,26 @@ def send_brief(c, chat, t):
     except Exception as e:
         print("brief gemini failed:", e)
         msg = "Good morning Sunny ☀️ Uth jao, naya din hai!\n\nYOUR DAY\n" + ("\n".join(glance) or "Din khaali hai, tum decide karo 😄")
-    tg("sendMessage", chat_id=chat, text=msg[:3500])
+    brief_send(c, chat, t, "greeting", msg[:3500])
     if calendar_link.accounts(c):
         start=t.replace(hour=0,minute=0,second=0,microsecond=0)
         caltext=calendar_link.display(c,start,start+timedelta(days=1))
-        for offset in range(0,len(caltext),3900):tg("sendMessage",chat_id=chat,text=caltext[offset:offset+3900],disable_web_page_preview=True)
+        for offset in range(0,len(caltext),3900):brief_send(c, chat, t, "calendar_"+str(offset), caltext[offset:offset+3900])
     mail = gmail_link.brief(c)
-    tg("sendMessage", chat_id=chat, text=mail[:4000], disable_web_page_preview=True)
+    brief_send(c, chat, t, "mail", mail[:4000])
     try:
         docs, _ = gmail_link.content(c, 'recent inbox mail')
         draft_reports = prepare_mail_drafts(c, docs)
-        for report in draft_reports:
-            tg("sendMessage", chat_id=chat, text=report[:4000], disable_web_page_preview=True)
+        for i, report in enumerate(draft_reports):
+            brief_send(c, chat, t, "draft_"+str(i), report[:4000])
     except Exception:
         print("morning reply draft check failed")
     news = world_news()
     if news:
-        tg("sendMessage", chat_id=chat, text=("🌍 WORLD BRIEF\n\n" + news)[:4000], disable_web_page_preview=True)
+        brief_send(c, chat, t, "news", ("🌍 WORLD BRIEF\n\n" + news)[:4000])
         c.add_turn(chat, "[system: morning brief sent]", msg + "\n\n" + news[:1500])
     else:
-        tg("sendMessage", chat_id=chat, text="World brief abhi nahi la payi, search thoda busy hai. Thodi der mein phir try karungi 🙏")
+        brief_send(c, chat, t, "news_pending", "World brief abhi nahi la payi, search thoda busy hai. Thodi der mein phir try karungi 🙏")
         c.kv_set("news_retry", t.strftime("%Y-%m-%d") + "|0"); c.kv_set("news_retry_ts", time.time())
         c.add_turn(chat, "[system: morning brief sent]", msg)
 
