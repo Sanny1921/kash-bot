@@ -443,6 +443,8 @@ def tick(c, notify):
         for job in j.values():
             age = now - job['created']
             if job['action'] == 'browse' and job['status'] in ('done', 'failed') and not job.get('delivered'):
+                if job.get('args', {}).get('origin') == 'campus':
+                    continue  # campus.py delivers these (silent when nothing new)
                 job['delivered'] = True
                 changed = True
                 if job['status'] == 'done':
