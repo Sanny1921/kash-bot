@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import urllib.error
 import urllib.request
 
@@ -222,6 +223,12 @@ def execute(root, job):
             return do_run(root, args.get("command", ""))
         if action == "open":
             return do_open(root, args.get("path", ""))
+        if action == "browse":
+            try:
+                import kash_browser
+            except ImportError:
+                return False, "", "kash_browser.py must sit in the same folder as kash_helper.py - download it from the repo."
+            return kash_browser.browse(args)
         return False, "", "unknown action: " + str(action)
     except ValueError as e:
         return False, "", str(e)
@@ -235,6 +242,16 @@ def main():
     if "--server" in args:
         i = args.index("--server")
         server = args[i + 1]
+    for flag, fn in (("--save-login", "save_login"), ("--forget-login", "forget_login")):
+        if flag in args:
+            import kash_browser
+            i = args.index(flag)
+            getattr(kash_browser, fn)(args[i + 1] if len(args) > i + 1 else "")
+            return
+    if "--list-logins" in args:
+        import kash_browser
+        kash_browser.list_logins()
+        return
     cfg = load_config()
     if "--unpair" in args:
         if cfg and os.path.exists(CONFIG_PATH):
