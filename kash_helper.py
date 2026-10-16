@@ -248,6 +248,25 @@ def main():
             i = args.index(flag)
             getattr(kash_browser, fn)(args[i + 1] if len(args) > i + 1 else "")
             return
+    if "--wake" in args:
+        cfg = load_config()
+        if not cfg:
+            print("Pair this helper first (run it without --wake, enter the code from KASH).")
+            return
+        try:
+            import kash_wake
+        except ImportError:
+            print("kash_wake.py must sit in the same folder as kash_helper.py - download it from the repo.")
+            return
+        mins = 120
+        if "--wake-minutes" in args:
+            try:
+                mins = int(args[args.index("--wake-minutes") + 1])
+            except (ValueError, IndexError):
+                print("--wake-minutes needs a number, e.g. --wake-minutes 60")
+                return
+        kash_wake.run(cfg, api, minutes=mins, say_aloud="--no-voice" not in args)
+        return
     if "--list-logins" in args:
         import kash_browser
         kash_browser.list_logins()
