@@ -143,6 +143,31 @@ def _text(page, limit=6000):
     return t[:limit]
 
 
+LOADING = re.compile(r"^\W*(loading|please wait)[\w\s.,!]*$", re.I)
+
+
+def _settle(page, budget=40):
+    """Wait for a single-page app to actually render: network idle, then real text (not 'Loading, please wait')."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    end = time.time() + budget
+    stable, last = 0, ""
+    while time.time() < end:
+        t = _text(page, 3000)
+        if len(t) > 80 and not LOADING.match(t) and "loading, please wait" not in t.lower()[:200]:
+            stable = stable + 1 if t == last else 0
+            last = t
+            if stable >= 1:
+                return True
+        else:
+            last = ""
+            stable = 0
+        time.sleep(2)
+    return False
+
+
 def browse(args):
     """args: site, task ('assignments' | 'read'), url (optional). Returns (ok, output, error)."""
     site = site_key(args.get("site"))
@@ -173,10 +198,10 @@ def browse(args):
                     time.sleep(3)
                 if _has_pw(page):
                     return False, "", "Still on the login page - captcha/MFA/wrong password. Solve it in the open window, or re-save the login."
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+            if not _settle(page):
+                return False, "", ("Page abhi bhi load nahi hua (sirf 'Loading' dikh raha). Internet/site slow ho sakta hai - thodi der baad dobara try karo.")
+            if _has_pw(page):
+                return False, "", "Login nahi ho paya - password field abhi bhi dikh raha hai. Login dobara save karo: python kash_helper.py --save-login %s" % site
             out.append("PAGE: %s\n%s" % (page.url, _text(page, 3000)))
             if args.get("task") == "assignments":
                 links = page.locator("a:visible").all()[:200]
@@ -190,10 +215,22 @@ def browse(args):
                         seen.add(label.lower())
                         try:
                             a.click(timeout=5000)
-                            page.wait_for_load_state("networkidle", timeout=15000)
+                            _settle(page, 20)
                         except Exception:
                             pass
                         out.append("SECTION '%s' - %s\n%s" % (label[:60], page.url, _text(page, 4000)))
             return True, "\n\n".join(out)[:12000], ""
         finally:
             ctx.close()
+
+
+def open_url(args):
+    """Open an https YouTube page in the default Chrome profile window. Narrow allowlist."""
+    import webbrowser
+    from urllib.parse import urlparse
+    u = urlparse(str(args.get("url", "")))
+    host = (u.hostname or "").lower()
+    if u.scheme != "https" or not (host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be"):
+        return False, "", "Sirf YouTube links khol sakti hoon."
+    webbrowser.open(u.geturl())
+    return True, "opened " + u.geturl(), ""

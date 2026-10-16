@@ -229,6 +229,12 @@ def execute(root, job):
             except ImportError:
                 return False, "", "kash_browser.py must sit in the same folder as kash_helper.py - download it from the repo."
             return kash_browser.browse(args)
+        if action == "openurl":
+            try:
+                import kash_browser
+            except ImportError:
+                return False, "", "kash_browser.py must sit in the same folder as kash_helper.py - download it from the repo."
+            return kash_browser.open_url(args)
         return False, "", "unknown action: " + str(action)
     except ValueError as e:
         return False, "", str(e)

@@ -10,7 +10,7 @@ in chat. State lives in the kv store, so MongoDB and sqlite both work.
 """
 import hashlib, hmac, json, re, secrets, threading, time, urllib.parse
 
-AUTO_ACTIONS = {"list", "read", "write", "append", "browse"}
+AUTO_ACTIONS = {"list", "read", "write", "append", "browse", "openurl"}
 ASK_ACTIONS = {"delete", "run", "open"}
 ONLINE_SECONDS = 120
 JOB_KEEP = 86400
@@ -23,6 +23,8 @@ _LOCK = threading.Lock()
 TOPIC = re.compile(r'\b(?:laptops?|computers?|pc|desktops?|devices?|phones?|mobiles?)\b', re.I)
 PAIR_RE = re.compile(r'\bpair\b|\bconnect\b|\bjod(?:o|na)?\b', re.I)
 LISTQ_RE = re.compile(r'which (?:device|machine)|what machine|devices? (?:are )?(?:connected|paired|online)|(?:laptop|computer|phone) (?:online|connected|paired)|kahan chal rahi|kis machine|kaunse device', re.I)
+YT_RE = re.compile(r'\b(?:youtube|yt|play|gana|gaana|song|songs|sunao|chala(?:o|na)?|bajao)\b', re.I)
+YT_STRIP = re.compile(r'\b(?:please|pls|kash|on|in|my|the|laptop|computer|youtube|yt|play|open|search|for|a|song|songs|gana|gaana|sunao|chalao|chala|chalana|bajao|kholo|karo|kar|do|de|mujhe|mera|meri|ko|pe|par|se|and|then)\b', re.I)
 BROWSE_RE = re.compile(r'(?:digi+campus|assignments?)', re.I)
 BROWSE_ACT = re.compile(r'\b(?:check|pending|due|dekh|dekho|batao|open|read|kya|any|list|show|status)\b', re.I)
 ACT_RE = re.compile(r'\b(?:list|show|read|open|create|write|make|delete|remove|append|add|run|execute|install|files?|folder|directory|command|dikhao|banao|padho|hatao|chalao|kholo|likho)\b', re.I)
@@ -90,6 +92,7 @@ def capability(c):
         state = 'online' if now - dev.get('last_seen', 0) < ONLINE_SECONDS else 'offline'
         parts.append('%s (%s, %s, folder %s)' % (dev['name'], dev.get('os', '?'), state, dev.get('root', '~/KASH')))
     return ('Local devices: ' + '; '.join(parts) + '. AUTO actions inside each device folder: list, read, create, append. '
+            'Also AUTO: opening YouTube search/pages and reading DigiCampus in his laptop browser (so never say you cannot open YouTube or play songs while a device is paired - the router does it; if you are answering here, tell him to say e.g. "play majaal song"). '
             'Delete, run command and open need his Telegram confirmation first. '
             'Never claim a device action happened unless a system note says it completed.')
 
@@ -347,11 +350,31 @@ def route(c, text, chat, b):
                 dev = d[ids[idx]]
                 return _dispatch_for(c, chat, dev, p['request'], data)
         return None
+    if YT_RE.search(stripped) and devices(c) and not BROWSE_RE.search(stripped) and not re.search(r'\b(?:delete|remove|run|install|file|folder)\b', stripped, re.I):
+        q = re.sub(r'\s+', ' ', YT_STRIP.sub(' ', re.sub(r'[^\w\s]', ' ', stripped))).strip()
+        return _youtube_start(c, chat, q, stripped)
     if BROWSE_RE.search(stripped) and BROWSE_ACT.search(stripped) and devices(c):
         return _browse_start(c, chat, stripped)
     if not TOPIC.search(stripped) or not ACT_RE.search(stripped):
         return None
     return _dispatch(c, chat, b, stripped)
+
+
+def _youtube_start(c, chat, q, original):
+    d = devices(c)
+    online = [x for x in d.values() if time.time() - x.get('last_seen', 0) < ONLINE_SECONDS] or list(d.values())
+    dev = sorted(online, key=lambda x: -x.get('last_seen', 0))[0]
+    if q:
+        url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote_plus(q[:120])
+    else:
+        url = 'https://www.youtube.com/'
+    job = enqueue(c, chat, dev['id'], 'openurl', {'url': url}, True)
+    done = wait_result(c, job['id'], timeout=10)
+    if done and done['status'] == 'done':
+        return ('Khol diya 🙂 YouTube pe %s ka search %s ke browser mein khul gaya. Jo pasand aaye usse play kar lena.' % (('"' + q + '"') if q else 'home', dev['name']))
+    if done and done['status'] == 'failed':
+        return '❌ YouTube nahi khul paya: ' + _clean(done.get('error'), 300)
+    return '%s abhi offline lag raha hai. Helper chalu hote hi YouTube khol dungi.' % dev['name']
 
 
 def _browse_start(c, chat, request):
