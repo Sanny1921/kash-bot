@@ -60,3 +60,28 @@ a background helper on iOS).
   path outside it.
 - Tell KASH `/unpair` (or "unpair my laptop") to kill a device's token
   anytime. The helper just stops working.
+
+## Browser skill (v7) - KASH checks websites on your laptop, read-only
+
+KASH opens a visible Chrome/Edge window on your laptop, signs in with a login
+YOU saved on that laptop, and reads the page. She never clicks Submit, Delete,
+Pay, Send etc. - only the login button and read-only navigation links.
+Your password never goes through Telegram, Render or GitHub.
+
+One-time setup (Windows and Linux):
+1. Put **both** `kash_helper.py` and `kash_browser.py` in the same folder.
+2. `pip install playwright` (uses your installed Chrome or Edge, no big download).
+3. Save the login, typing the password in this terminal (hidden):
+   `python kash_helper.py --save-login msu.digiicampus.com`
+4. Restart the helper. On Telegram say: **check my DigiCampus assignments**.
+
+If a captcha/MFA shows in the window, solve it there (she waits 2 minutes).
+The browser keeps its own profile in `~/.kash/browser-profile`, so you stay
+logged in and captchas should be rare after the first time.
+
+Where the password lives: Windows - encrypted to your Windows account (DPAPI).
+Linux - a file only your user can read (obscured, NOT encrypted at rest).
+`--list-logins` shows saved sites, `--forget-login SITE` deletes one.
+Limits: laptop on + helper running; first run reads the dashboard and the
+first assignment-like pages as raw text, so expect to tune it after one real
+run; no submitting or changes - that stays out of scope until you ask.
