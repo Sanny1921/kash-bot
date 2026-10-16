@@ -12,6 +12,7 @@ import expense_log
 import natural_google
 import file_crud
 import reviews
+import device_agent
 import sys
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
@@ -126,7 +127,7 @@ class Health(BaseHTTPRequestHandler):
                     "File updates append reviewed plain text to private app-authorized Docs or replace exact Sheet ranges after old/new-cell review. Reviewed deletion moves to Trash, never permanent deletion. Generated document drafts use saved user facts, not inbox scraping. Older files require an optional wider Drive consent; KASH still limits changes to private owned files, review/confirmation and Trash only. "
                     "The optional expense log stores only owner-confirmed manual entries in MongoDB with exact integer minor units. Currency/date/amount are previewed; weekly sums separate currencies and include confirmed entries only. It does not access banks/cards, pay, import statements, edit or delete entries. Expense text is not sent to the model. "
                     "Private quick-capture notes are stored in MongoDB separately from chat memory, searched literally and returned only to the owner. They are not sent to the language model. Secret-looking text is rejected; media capture, sharing, editing and deletion are not supported. "
-                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. Optional reply watches use only Gmail metadata for an owner-confirmed exact sender/thread, checked hourly for up to 30 days; sender identity is not authenticated and offline delays are possible. /replywatches lists/stops watches. No email bodies or outbound messages are used by watches. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. "
+                    "Google suite consent also requests Drive read and app-created-file access, Contacts read and Tasks access for later tools. Google scopes can technically permit sends, edits and deletes; KASH's implemented actions remain narrower and Gmail sending is forbidden. Suite tokens are encrypted separately from existing Gmail tokens. Drive search/read and creation of new plain-text Docs/Sheets are active. Selected file extracts go to Gemini for requested summaries. Sensitive/authentication-looking content is skipped. No file sharing, deletion or edits to existing files. Text/data creation is verified by API readback but is not visually polished or inspected. Contacts lookup is read-only, queried by name. No bulk export, messaging or contact edits. Contact search results expire after 15 minutes and are not fed to the model. Google Tasks reads selected list titles and pending task titles/dates into the private Telegram chat and creates new tasks after account/list/content review. No completion, edits, deletion or assignment; due dates are date-only, no alarm. Task contents are not sent to the model. Optional reply watches use only Gmail metadata for an owner-confirmed exact sender/thread, checked hourly for up to 30 days; sender identity is not authenticated and offline delays are possible. /replywatches lists/stops watches. No email bodies or outbound messages are used by watches. /googledisconnect email removes suite tokens locally without revoking existing Gmail tokens. Calendar uses separate per-account encrypted tokens. It reads selected calendar event times, titles and locations for private schedule answers and the morning brief. Event text is displayed as data, not instructions. The configured model parses the owner's requests, not calendar contents. Only reviewed events can be created in an owned calendar; no guest invitations, event edits or deletions. Use /calendardisconnect email to remove a Calendar connection locally without touching Gmail. An optional helper program on Sunny's own devices polls this service outward over HTTPS with a paired device token from a one-time 6-digit chat code; no device port is exposed. It works only inside one chosen folder per device: listing, reading, creating and appending files run directly; deleting, running commands and opening apps run only after his explicit Telegram confirmation within 15 minutes. File contents and command output return only to his private Telegram chat. /unpair removes a device and kills its token. "
                     "The mail section goes only to Sunny's private Telegram chat. Use /gmaildisconnect email to remove one saved connection, or /gmaildisconnect all to remove all tokens "
                     "and revoke access, or revoke KASH in your Google Account's third-party connections. Contact: " + gmail_link.EMAIL)
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
@@ -135,7 +136,15 @@ class Health(BaseHTTPRequestHandler):
             self.send_response(503); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(b"KASH is starting. Please try again shortly."); return
         if calendar_link.handle_http(self,self.server.store):return
+        if device_agent.handle_http(self,self.server.store,lambda t,m:tg("sendMessage",chat_id=t,text=m)):return
         if not gmail_link.handle_http(self, self.server.store): self._ok()
+    def do_POST(self):
+        if self.server.store is None:
+            self.send_response(503); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(b"KASH is starting. Please try again shortly."); return
+        if device_agent.handle_http(self,self.server.store,lambda t,m:tg("sendMessage",chat_id=t,text=m)): return
+        self.send_response(404); self.send_header("Content-Type", "text/plain"); self.end_headers()
+        self.wfile.write(b"not found")
     def do_HEAD(self): self._ok(False)
     def log_message(self, *a): pass
 
@@ -382,6 +391,7 @@ def scheduler(c):
                         elif d["status"] == "fired" and d.get("nudged") and now - d["fired_ts"] > 24 * 3600:
                             d["status"] = "done"; c.rem_put(d)
                 reply_watches.check(c,lambda target,message:tg("sendMessage",chat_id=target,text=message,disable_web_page_preview=True))
+                device_agent.tick(c,lambda target,message:tg("sendMessage",chat_id=target,text=message))
                 t = datetime.now(IST)
                 today = t.strftime("%Y-%m-%d")
                 schedule_brief(c, chat, t)
@@ -1214,6 +1224,13 @@ def _reply_core(c, chat, text, audio=None, note=None, source_id=None):
 
     approval=reviews.approve(c,text or '',chat,sys.modules[__name__])
     if approval is not None:return approval,text
+    device_approval=device_agent.approve(c,text or '',chat)
+    if device_approval is not None:return device_approval,text
+    device_answer=device_agent.route(c,text,chat,sys.modules[__name__])
+    if device_answer is not None:
+        heard="[voice note] "+text if audio else text
+        c.add_turn(chat,heard,"[Local device request handled separately; file contents and command output are not stored in chat history.]")
+        return device_answer,heard
     file_answer=file_crud.request(c,text,chat,sys.modules[__name__])
     if file_answer is not None:
         c.add_turn(chat,"[Google file request]","[Read or reviewed file change handled separately; content omitted from chat history.]")
@@ -1272,6 +1289,7 @@ def _reply_core(c, chat, text, audio=None, note=None, source_id=None):
     system += "\nCURRENT CONTACTS: "+contact_capability(c)+" Never invent contact details or use them to message anyone."
     system += "\nCURRENT GOOGLE FILE TOOLS: "+drive_capability(c)+" Never claim file contents or actions from memory."
     system += "\nCURRENT CALENDAR: " + calendar_capability(c) + " Never claim Calendar actions or contents from chat memory. Schedule queries use the separate live route."
+    system += "\nCURRENT LOCAL DEVICES: " + device_agent.capability(c)
     system += "\nStay on the newest request. Never bring up mood, feeling low, emotional state or check-ins unless Sunny asks for emotional support now. Old chat/memory about mood is not a reason to interrupt a task. Do not recite permission or privacy policy blocks. Do not recommend slash commands for supported natural-language tasks; give a plain-language example and ask only the missing detail."
     if note:
         system += "\n\n" + note
@@ -1428,6 +1446,10 @@ def handle(c, msg):
             if drafts and link:
                 ans = "Enable reply drafts for " + email + ". Google's compose permission technically also allows sending, but KASH has only draft creation and will never send. Existing read access keeps working if you skip this. Review and send drafts yourself in Gmail. Private link expires in 30 minutes.\n" + link
         tg("sendMessage", chat_id=chat, text=ans[:4000], disable_web_page_preview=True); return
+    if text.split()[0].split('@')[0].lower() in ('/pair','/devices','/unpair','/devicehelp'):
+        ans=device_agent.command(c,text,chat)
+        for offset in range(0,len(ans),3900):tg("sendMessage",chat_id=chat,text=ans[offset:offset+3900],disable_web_page_preview=True)
+        return
     if text.startswith("/memories"):
         m = clean_facts(c)
         tg("sendMessage", chat_id=chat, text=("Yeh sab mujhe yaad hai:\n" + "\n".join(f"{i+1}. {f}" for i, f in enumerate(m))) if m else "Abhi kuch khaas yaad nahi, batao apne baare mein 🙂"); return
