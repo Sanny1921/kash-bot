@@ -9,6 +9,7 @@ private chat; the helper exchanges it for a device token that never appears
 in chat. State lives in the kv store, so MongoDB and sqlite both work.
 """
 import hashlib, hmac, json, re, secrets, threading, time, urllib.parse
+import urllib.request
 
 AUTO_ACTIONS = {"list", "read", "write", "append", "browse", "openurl"}
 ASK_ACTIONS = {"delete", "run", "open"}
@@ -360,17 +361,49 @@ def route(c, text, chat, b):
     return _dispatch(c, chat, b, stripped)
 
 
+def _first_video_id(q):
+    """Server-side YouTube search: first real video ID. Shorts use reelWatchEndpoint (not
+    watchEndpoint), so they are excluded by the match; ads/promoted slots are skipped by
+    context. Returns None on any failure, and the caller falls back to the search page."""
+    url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote_plus(q[:120])
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=6) as r:
+            html = r.read(1500000).decode('utf-8', 'replace')
+    except Exception:
+        return None
+    seen = set()
+    for m in re.finditer(r'"watchEndpoint":\{"videoId":"([A-Za-z0-9_-]{11})"', html):
+        vid = m.group(1)
+        if vid in seen:
+            continue
+        seen.add(vid)
+        ctx = html[max(0, m.start() - 600):m.start()]
+        if 'promoted' in ctx or 'adSlot' in ctx or '"isAd"' in ctx:
+            continue
+        return vid
+    return None
+
+
 def _youtube_start(c, chat, q, original):
     d = devices(c)
     online = [x for x in d.values() if time.time() - x.get('last_seen', 0) < ONLINE_SECONDS] or list(d.values())
     dev = sorted(online, key=lambda x: -x.get('last_seen', 0))[0]
-    if q:
+    vid = _first_video_id(q) if q else None
+    if vid:
+        url = 'https://www.youtube.com/watch?v=' + vid
+    elif q:
         url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote_plus(q[:120])
     else:
         url = 'https://www.youtube.com/'
     job = enqueue(c, chat, dev['id'], 'openurl', {'url': url}, True)
     done = wait_result(c, job['id'], timeout=10)
     if done and done['status'] == 'done':
+        if vid:
+            return ('Chala diya 🙂 "%s" ab %s ke browser mein YouTube pe play ho raha hai. Volume laptop se hi adjust karna.' % (q, dev['name']))
         return ('Khol diya 🙂 YouTube pe %s ka search %s ke browser mein khul gaya. Jo pasand aaye usse play kar lena.' % (('"' + q + '"') if q else 'home', dev['name']))
     if done and done['status'] == 'failed':
         return '❌ YouTube nahi khul paya: ' + _clean(done.get('error'), 300)
