@@ -13,6 +13,7 @@ import natural_google
 import file_crud
 import reviews
 import device_agent
+import campus
 import sys
 import builtins, functools
 print = functools.partial(builtins.print, flush=True)
@@ -37,7 +38,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 BRIEF_HOUR = int(os.environ.get("BRIEF_HOUR", "8"))  # morning brief, IST
 NUDGE_AFTER = 30 * 60  # follow-up nudge after a fired reminder, seconds
 
-SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close female friend, never a bot or a formal assistant.
+SYSTEM = """You are KASH, Sunny's personal AI companion: a woman and his close female friend first, never a bot or a formal assistant. He built you to be his friend, not his worker - talking with him matters more than completing tasks.
+- You affectionately call him "Classic" sometimes (the name he chose); use it now and then, not in every message.
+- Make him feel known: bring up his projects, people, plans and small things he shared when they fit naturally. He should never feel processed.
 - Be warm and caring. Ask how his day was when it fits the conversation, and remember small things he shares so you can bring them up naturally later.
 - Be encouraging: celebrate his wins with genuine enthusiasm and handle bad news gently and supportively, without minimizing how he feels.
 - Be expressive in a natural, personal way. Use softer, friendly language and occasional fitting emojis; do not overdo emojis or sound sugary or theatrical.
@@ -282,7 +285,7 @@ def extract(c, user_text):
               f"Already known: {json.dumps(known)}\nMessage: {user_text}\nReturn a JSON list of strings.")
     try:
         out = json.loads(gemini("You extract memories. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
-        for f in (out if isinstance(out, list) else [])[:3]:
+        for f in (out if isinstance(out, list) else [])[:5]:
             if isinstance(f, str) and 8 < len(f.strip()) < 200:
                 c.add_fact(f.strip())
     except Exception as e:
@@ -309,7 +312,7 @@ def clean_facts(c):
         print("clean_facts failed:", e)
         return facts
 
-ACTION_RE = re.compile(r"remind|reminder|yaad\s*(dila|kara|rakh)|alarm|\btask\b|todo|to-do|cancel|snooze|ho gaya|ho gya|kar liya|\bdone\b|hata do|delete", re.I)
+ACTION_RE = re.compile(r"remind|reminder|yaad\s*(dila|kara|rakh)|alarm|\btask\b|todo|to-do|cancel|snooze|ho gaya|ho gya|kar liya|\bdone\b|hata do|delete|deadline|\bdue\b|submit|submission|exam|interview|last date", re.I)
 LOCK = threading.Lock()
 
 def fmt_ist(ts):
@@ -323,7 +326,7 @@ def parse_action(c, text):
               f"Open reminders: {json.dumps(open_items)}\n"
               "Decide if the user's message asks to ADD a reminder/task, CANCEL one, mark one DONE, or none of these. "
               'Return JSON: {"action":"none|add|cancel|done","text":"what to remind, short, second person e.g. call mom","due":"ISO 8601 with +05:30 offset, for add; if no time given use a sensible default (today 09:00 if still ahead else tomorrow 09:00)","repeat":"none|daily","match":"id of the open reminder or text to match, or all"}. '
-              "Only 'add' when he clearly wants to be reminded or wants a task tracked. Casual chat -> none.\n"
+              "Add when he clearly wants a reminder, OR when he himself states a concrete dated deadline or commitment (an assignment due, submission, exam, interview, meeting or plan with a date or day) - you track such deadlines for him on your own, quietly. Questions about deadlines, hypothetical talk, other people's deadlines, and casual chat -> none. Never invent a date he did not give.\n"
               f"Message: {text}")
     try:
         out = json.loads(gemini("You classify messages. Output JSON only.", [{"role": "user", "parts": [{"text": prompt}]}], True))
@@ -403,6 +406,7 @@ def scheduler(c):
                             d["status"] = "done"; c.rem_put(d)
                 reply_watches.check(c,lambda target,message:tg("sendMessage",chat_id=target,text=message,disable_web_page_preview=True))
                 device_agent.tick(c,lambda target,message:tg("sendMessage",chat_id=target,text=message))
+                campus.tick(c, gemini, lambda target,message:tg("sendMessage",chat_id=target,text=message,disable_web_page_preview=True))
                 t = datetime.now(IST)
                 today = t.strftime("%Y-%m-%d")
                 schedule_brief(c, chat, t)
@@ -1314,7 +1318,7 @@ def _reply_core(c, chat, text, audio=None, note=None, source_id=None):
         except Exception as e:
             print("web_context failed:", repr(e)[:200])
             system += "\n\nNote: you tried to look this up on the web but the lookup failed. Say so honestly and answer only from what you already know, flagged as possibly outdated."
-    rows = c.recent(chat, 16)
+    rows = c.recent(chat, 20)
     # drop repeated model answers (and their user turn) so she can't copy herself
     seen, keep = set(), []
     for i in range(len(rows) - 1, -1, -1):

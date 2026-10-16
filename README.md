@@ -40,3 +40,9 @@ enter the one-time 6-digit code in the helper. Scope: one folder per device
 Sunny on Telegram first. Setup steps: see `HELPER.md`. Server side lives in
 `device_agent.py` (`/agent/pair`, `/agent/poll`, `/agent/result`); tests in
 `test_local_access.py`.
+
+## v8: DigiCampus watch + warmer KASH
+
+- DigiCampus assignments checked through the laptop helper twice a day (morning + evening IST). KASH messages only when something changed: new assignment, moved due date, or a deadline within 48 hours. Nothing new = silence. Due-soon items also get a normal reminder automatically.
+- Persona: friend-first, warmer, calls him "Classic", remembers more per message.
+- Deadlines: when Sunny mentions a dated deadline in chat, KASH tracks it herself (quietly) and confirms in one line.
