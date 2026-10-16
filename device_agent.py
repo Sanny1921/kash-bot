@@ -480,6 +480,9 @@ def tick(c, notify):
             print('device tick notify failed:', repr(e)[:200])
 
 
+SAY_HOOK = None  # set by bot.py: fn(store, chat, text) -> reply text (wake-word mode)
+
+
 # ---------- HTTP endpoints (helper side) ----------
 
 def _send(h, status, obj):
@@ -609,6 +612,23 @@ def handle_http(h, store, notify=None):
         except Exception as e:
             print('device result notify failed:', repr(e)[:200])
         _send(h, 200, {'ok': True})
+        return True
+    if path == '/agent/say' and h.command == 'POST':
+        body = _read_json(h) or {}
+        device_id = str(body.get('device_id', ''))
+        dev = _auth(c, h, device_id)
+        if not dev:
+            _send(h, 401, {'error': 'unauthorized'})
+            return True
+        if SAY_HOOK is None:
+            _send(h, 503, {'error': 'voice not available'})
+            return True
+        try:
+            reply = SAY_HOOK(c, dev['chat'], str(body.get('text', '')))
+        except Exception as e:
+            print('say failed:', repr(e)[:200])
+            reply = 'Something broke on my side, check Telegram.'
+        _send(h, 200, {'reply': reply})
         return True
     _send(h, 404, {'error': 'not found'})
     return True
