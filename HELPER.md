@@ -85,3 +85,19 @@ Linux - a file only your user can read (obscured, NOT encrypted at rest).
 Limits: laptop on + helper running; first run reads the dashboard and the
 first assignment-like pages as raw text, so expect to tune it after one real
 run; no submitting or changes - that stays out of scope until you ask.
+
+## Wake word mode (optional, off by default)
+
+Say "Hey KASH" (or "hey cash", "hi kash") plus your request; she answers out loud and a copy lands in Telegram.
+
+Start it only when you want it: `python kash_helper.py --wake` (add `--wake-minutes 60` to change the auto-stop, default 120; `--no-voice` for text-only replies).
+
+Setup once: put `kash_wake.py` next to `kash_helper.py`, then `pip install vosk sounddevice` (Linux also: `sudo apt install libportaudio2 espeak-ng`). First run offers a free ~36 MB offline speech model download (asks y/N).
+
+Privacy and limits:
+- Wake detection and speech-to-text run on your laptop (Vosk, offline). Mic audio is never saved and never uploaded. Only the text of your request goes to KASH.
+- The mic is open only while the window is running, and the window says so. Stop with Ctrl+C, closing the window, or "Hey KASH, stop listening". It auto-stops after the time limit.
+- Approvals never work by voice (a TV or a friend could say "yes"). Anything risky is asked in Telegram and you answer there. Same ask-first rules as typed messages.
+- It is not as accurate as a phone assistant: small offline model, Indian English works best, Hinglish and noisy rooms get misheard, and it can mistake similar words. Max 40 voice requests per hour.
+- Replies are read with your computer's own voice (Windows/macOS built in, Linux espeak-ng), not KASH's Telegram voice. Free: no extra Gemini quota except for the answer itself.
+- Needs the laptop awake and the Render server up (free tier can take ~30 s to wake after idle).
