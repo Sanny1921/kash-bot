@@ -582,7 +582,7 @@ def news_rss(q, n=7):
         url = base + "/search?q=" + urllib.parse.quote(q)
     else:
         url = base
-    url += "&hl=en-IN&gl=IN&ceid=IN:en"
+    url += ("&" if "?" in url else "?") + "hl=en-IN&gl=IN&ceid=IN:en"
     body, _ = http_get(url)
     out = []
     for it in ET.fromstring(body).iter("item"):
