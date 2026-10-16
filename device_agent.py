@@ -10,7 +10,7 @@ in chat. State lives in the kv store, so MongoDB and sqlite both work.
 """
 import hashlib, hmac, json, re, secrets, threading, time, urllib.parse
 
-AUTO_ACTIONS = {"list", "read", "write", "append"}
+AUTO_ACTIONS = {"list", "read", "write", "append", "browse"}
 ASK_ACTIONS = {"delete", "run", "open"}
 ONLINE_SECONDS = 120
 JOB_KEEP = 86400
@@ -23,6 +23,8 @@ _LOCK = threading.Lock()
 TOPIC = re.compile(r'\b(?:laptops?|computers?|pc|desktops?|devices?|phones?|mobiles?)\b', re.I)
 PAIR_RE = re.compile(r'\bpair\b|\bconnect\b|\bjod(?:o|na)?\b', re.I)
 LISTQ_RE = re.compile(r'which (?:device|machine)|what machine|devices? (?:are )?(?:connected|paired|online)|(?:laptop|computer|phone) (?:online|connected|paired)|kahan chal rahi|kis machine|kaunse device', re.I)
+BROWSE_RE = re.compile(r'(?:digi+campus|assignments?)', re.I)
+BROWSE_ACT = re.compile(r'\b(?:check|pending|due|dekh|dekho|batao|open|read|kya|any|list|show|status)\b', re.I)
 ACT_RE = re.compile(r'\b(?:list|show|read|open|create|write|make|delete|remove|append|add|run|execute|install|files?|folder|directory|command|dikhao|banao|padho|hatao|chalao|kholo|likho)\b', re.I)
 YES_RE = re.compile(r'(?:yes|yes please|do it|confirm|go ahead|ok|okay|haan|हाँ|हां)[.!]?', re.I)
 NO_RE = re.compile(r'(?:no|no thanks|cancel|cancel it|nahi|नहीं)[.!]?', re.I)
@@ -345,9 +347,21 @@ def route(c, text, chat, b):
                 dev = d[ids[idx]]
                 return _dispatch_for(c, chat, dev, p['request'], data)
         return None
+    if BROWSE_RE.search(stripped) and BROWSE_ACT.search(stripped) and devices(c):
+        return _browse_start(c, chat, stripped)
     if not TOPIC.search(stripped) or not ACT_RE.search(stripped):
         return None
     return _dispatch(c, chat, b, stripped)
+
+
+def _browse_start(c, chat, request):
+    """Read-only DigiCampus check on his laptop's own browser. Result is pushed to Telegram by tick()."""
+    d = devices(c)
+    online = [x for x in d.values() if time.time() - x.get('last_seen', 0) < ONLINE_SECONDS] or list(d.values())
+    dev = sorted(online, key=lambda x: -x.get('last_seen', 0))[0]
+    job = enqueue(c, chat, dev['id'], 'browse', {'site': 'msu.digiicampus.com', 'task': 'assignments'}, True)
+    return ('Checking DigiCampus on %s now. A browser window will open on the laptop - that is me. '
+            'If a captcha shows, tick it there. Results come here in about a minute.' % dev['name'])
 
 
 def _dispatch_for(c, chat, dev, request, data):
@@ -428,6 +442,14 @@ def tick(c, notify):
         notes = []
         for job in j.values():
             age = now - job['created']
+            if job['action'] == 'browse' and job['status'] in ('done', 'failed') and not job.get('delivered'):
+                job['delivered'] = True
+                changed = True
+                if job['status'] == 'done':
+                    notes.append((job['chat'], '🌐 DigiCampus (read-only, nothing changed). Raw page text, pending items are in here:\n\n' + str(job.get('output', ''))[:3500]))
+                else:
+                    notes.append((job['chat'], '❌ Browser check failed: ' + str(job.get('error', ''))[:600]))
+                continue
             if job['status'] == 'awaiting_approval' and now - job['updated'] > REVIEW_TTL:
                 job['status'] = 'expired'
                 job['updated'] = now
